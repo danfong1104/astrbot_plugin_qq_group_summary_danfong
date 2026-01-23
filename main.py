@@ -14,7 +14,6 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
-# 解析JSON
 def _parse_llm_json(text: str) -> dict:
     try:
         return json.loads(text)
@@ -29,8 +28,7 @@ def _parse_llm_json(text: str) -> dict:
         pass
     raise ValueError("无法从 LLM 回复中提取有效的 JSON 数据")
 
-
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "1.2.7")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.23")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -48,84 +46,105 @@ class GroupSummaryPlugin(Star):
         self.push_time = self.config.get("push_time", "23:00")
         self.push_groups = self.config.get("push_groups", [])
         
-        # 获取自定义提示词配置，默认为空则使用内置默认值
         self.summary_prompt_style = self.config.get("summary_prompt_style", "")
-
-        # 全局 Bot 实例缓存
         self.global_bot = None
 
-        # 加载模板
+        # 模板加载
         current_dir = os.path.dirname(os.path.abspath(__file__))
         template_path = os.path.join(current_dir, "templates", "report.html")
         try:
             with open(template_path, "r", encoding="utf-8") as f:
                 self.html_template = f.read()
-            logger.info(f"群聊总结(增强版): 成功加载模板: {template_path}")
+            logger.info(f"群聊总结(增强版): 模板加载成功 | v0.1.23 Load Success")
         except FileNotFoundError:
-            logger.error(f"群聊总结(增强版): 未找到模板文件: {template_path}")
+            logger.error(f"群聊总结(增强版): 模板文件丢失: {template_path}")
             self.html_template = "<h1>Template Not Found</h1>"
 
-        # 初始化定时器
+        # 定时任务
         self.scheduler = AsyncIOScheduler()
         if self.enable_auto_push:
             self.setup_schedule()
 
     def setup_schedule(self):
-        """设置定时任务"""
         try:
             hour, minute = self.push_time.split(":")
             trigger = CronTrigger(hour=int(hour), minute=int(minute))
             self.scheduler.add_job(self.run_scheduled_task, trigger)
             self.scheduler.start()
-            logger.info(f"群聊总结(增强版): 定时任务已启动，将于每天 {self.push_time} 推送至 {self.push_groups}")
+            logger.info(f"群聊总结(增强版): 定时推送已就绪 -> 每天 {self.push_time} 推送至 {self.push_groups}")
         except Exception as e:
-            logger.error(f"群聊总结(增强版): 定时任务启动失败，请检查时间格式(HH:MM): {e}")
+            logger.error(f"群聊总结(增强版): 定时任务启动失败: {e}")
 
-    # --- 自动捕获 Bot 实例 ---
+    # ================= 核心修复区域 =================
+    # 必须加上 *args, **kwargs 以兼容 AstrBot 传入的额外上下文参数
+    
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def capture_bot_instance(self, event: AstrMessageEvent):
-        """监听任意群消息以捕获 Bot 实例供定时任务使用"""
+    async def capture_bot_instance(self, event: AstrMessageEvent, *args, **kwargs):
+        """自动捕获 Bot 实例"""
         if self.global_bot is None:
             self.global_bot = event.bot
-            logger.info(f"群聊总结(增强版): 已成功捕获 Bot 实例，定时任务准备就绪。")
+            logger.info(f"群聊总结(增强版): Bot实例捕获成功，定时任务准备就绪。")
+
+    @filter.command("总结群聊")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def summarize_group(self, event: AstrMessageEvent, *args, **kwargs):
+        """手动指令"""
+        if self.global_bot is None:
+            self.global_bot = event.bot
+            
+        group_id = event.get_group_id()
+        yield event.plain_result(f"🌱 正在连接神经云端，回溯今日记忆...")
+        img_result = await self.generate_report(event.bot, group_id, silent=False)
+        if img_result:
+            yield event.image_result(img_result)
+        else:
+            yield event.plain_result("❌ 总结生成失败，可能是记录为空或鉴权失败。")
+
+    @filter.llm_tool(name="group_summary_tool")
+    async def call_summary_tool(self, event: AstrMessageEvent, *args, **kwargs):
+        """LLM调用工具"""
+        if self.global_bot is None:
+            self.global_bot = event.bot
+            
+        group_id = event.get_group_id()
+        yield event.plain_result(f"🌱 正在分析今日群聊内容...")
+        img_result = await self.generate_report(event.bot, group_id, silent=False)
+        if img_result:
+            yield event.image_result(img_result)
+        else:
+            yield event.plain_result("无法生成总结。")
+            
+    # ===============================================
 
     async def run_scheduled_task(self):
-        """定时任务执行逻辑"""
+        """定时任务逻辑"""
         try:
-            logger.info("群聊总结(增强版): [Step 1] 开始执行定时推送任务...")
+            logger.info("群聊总结(增强版): [Step 1] 开始定时推送...")
             
-            # 1. 检查 Bot 实例
             if self.global_bot is None:
-                logger.warning("群聊总结(增强版): [Warning] 尚未捕获到 Bot 实例。")
-                logger.warning("请确保 Bot 启动后至少接收到过一条群消息（任意群）。本次任务跳过。")
+                logger.warning("群聊总结(增强版): [Warning] 未捕获 Bot 实例，跳过本次推送。请确保 Bot 启动后收到过至少一条群消息。")
                 return
 
             bot = self.global_bot
-            logger.info(f"群聊总结(增强版): [Step 2] 使用 Bot 实例进行推送")
-            
             if not self.push_groups:
-                logger.warning("群聊总结(增强版): [Error] 推送列表(push_groups)为空，请在配置中添加群号。")
+                logger.warning("群聊总结(增强版): 推送列表为空。")
                 return
 
             for group_id in self.push_groups:
                 g_id_str = str(group_id)
-                logger.info(f"群聊总结(增强版): [Step 3] 正在处理群: {g_id_str}")
+                logger.info(f"群聊总结(增强版): 正在处理群 {g_id_str}")
                 
-                # 调用核心生成逻辑 (silent=True)
                 img_path = await self.generate_report(bot, g_id_str, silent=True)
-                logger.info(f"群聊总结(增强版): [Step 4] 图片生成结果: {img_path}")
                 
                 if img_path:
                     try:
                         cq_code = ""
-                        # --- 分支 A: 如果是网络链接 (http/https) ---
+                        # 网络图片
                         if img_path.startswith("http"):
-                            logger.info(f"群聊总结(增强版): [Step 5-A] 检测到远程 URL，直接使用 URL 构建 CQ 码")
                             cq_code = f"[CQ:image,file={img_path}]"
-                            
-                        # --- 分支 B: 如果是本地文件 ---
+                        # 本地图片转 Base64
                         else:
-                            # 路径清理
                             local_path = img_path
                             if local_path.startswith("file://"):
                                 local_path = local_path[7:]
@@ -133,42 +152,34 @@ class GroupSummaryPlugin(Star):
                                 local_path = local_path[1:]
 
                             if os.path.exists(local_path):
-                                logger.info(f"群聊总结(增强版): [Step 5-B] 正在读取本地文件并转码: {local_path}")
                                 with open(local_path, "rb") as image_file:
                                     encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
                                 cq_code = f"[CQ:image,file=base64://{encoded_string}]"
                             else:
-                                logger.error(f"群聊总结(增强版): [Error] 找不到本地图片文件，且不是远程 URL: {local_path}")
-                                continue # 跳过当前群
+                                logger.error(f"群聊总结(增强版): 图片文件不存在: {local_path}")
+                                continue
 
-                        # --- 发送逻辑 ---
                         if cq_code:
-                            logger.info(f"群聊总结(增强版): [Step 6] 正在调用 send_group_msg API...")
-                            # 强制转 int 确保 API 兼容
-                            ret = await bot.api.call_action("send_group_msg", group_id=int(g_id_str), message=cq_code)
-                            logger.info(f"群聊总结(增强版): [Success] 群 {g_id_str} 推送响应: {ret}")
+                            await bot.api.call_action("send_group_msg", group_id=int(g_id_str), message=cq_code)
+                            logger.info(f"群聊总结(增强版): 群 {g_id_str} 推送成功")
                             
                     except Exception as e:
-                        logger.error(f"群聊总结(增强版): [Error] 群 {g_id_str} 推送过程发生异常: {e}")
-                        logger.error(traceback.format_exc())
+                        logger.error(f"群聊总结(增强版): 群 {g_id_str} 推送异常: {e}")
                 else:
-                    logger.info(f"群聊总结(增强版): [Skip] 群 {g_id_str} 生成返回为空(可能无消息)，跳过。")
+                    logger.info(f"群聊总结(增强版): 群 {g_id_str} 无生成结果(可能无消息)")
                 
-                # 避免触发风控，暂停 5 秒
                 await asyncio.sleep(5)
                 
         except Exception as e:
-            logger.error(f"群聊总结(增强版): [Fatal Error] 定时任务发生严重错误: {e}")
+            logger.error(f"群聊总结(增强版): 定时任务严重错误: {e}")
             logger.error(traceback.format_exc())
 
     def get_today_start_timestamp(self):
-        """获取当天0点的时间戳"""
         now = datetime.datetime.now()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         return today_start.timestamp()
 
     async def fetch_group_history(self, bot, group_id: str, start_timestamp: float):
-        """分页获取群聊历史消息"""
         all_messages = []
         message_seq = 0
         cutoff_time = start_timestamp
@@ -210,7 +221,6 @@ class GroupSummaryPlugin(Star):
         return all_messages
 
     def process_messages(self, messages: list, start_timestamp: float):
-        """处理消息并进行黑名单过滤"""
         cutoff_time = start_timestamp
         valid_msgs = []
         user_counter = Counter()
@@ -244,7 +254,6 @@ class GroupSummaryPlugin(Star):
             trend_counter[str(int(hour_str))] += 1
 
         top_users = [{"name": name, "count": count} for name, count in user_counter.most_common(5)]
-        
         valid_msgs.sort(key=lambda x: x['time'])
         
         chat_log = "\n".join([
@@ -255,7 +264,6 @@ class GroupSummaryPlugin(Star):
         return valid_msgs, top_users, dict(trend_counter), chat_log
 
     async def generate_report(self, bot, group_id: str, silent: bool = False):
-        """核心生成逻辑"""
         today_start_ts = self.get_today_start_timestamp()
         
         try:
@@ -276,13 +284,10 @@ class GroupSummaryPlugin(Star):
         if len(chat_log) > self.msg_token_limit:
             chat_log = chat_log[:self.msg_token_limit]
 
-        # --- 获取自定义提示词 ---
-        # 如果用户未配置，使用默认提示
         user_style = self.config.get("summary_prompt_style")
         if not user_style:
             user_style = f"写一段“{self.bot_name}的悄悄话”作为总结，风格温暖、感性，对今天群里的氛围进行点评。"
         
-        # 支持 {bot_name} 变量替换
         if "{bot_name}" in user_style:
             user_style = user_style.replace("{bot_name}", self.bot_name)
 
@@ -308,7 +313,7 @@ class GroupSummaryPlugin(Star):
             analysis_data = _parse_llm_json(response.completion_text)
         except Exception as e:
             logger.error(f"LLM Error: {e}")
-            analysis_data = {"topics": [], "closing_remark": "总结生成失败，请检查后台日志。"}
+            analysis_data = {"topics": [], "closing_remark": "总结生成失败。"}
 
         try:
             render_data = {
@@ -325,36 +330,3 @@ class GroupSummaryPlugin(Star):
         except Exception as e:
             logger.error(f"Render Error: {e}")
             return None
-
-    # --- 指令入口 (手动触发) ---
-    @filter.command("总结群聊")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def summarize_group(self, event: AstrMessageEvent):
-        """手动指令：/总结群聊"""
-        # 只要手动触发，顺便也缓存一下 Bot
-        if self.global_bot is None:
-            self.global_bot = event.bot
-            
-        group_id = event.get_group_id()
-        yield event.plain_result(f"🌱 正在回溯今日记忆...")
-        img_result = await self.generate_report(event.bot, group_id, silent=False)
-        if img_result:
-            yield event.image_result(img_result)
-        else:
-            yield event.plain_result("❌ 总结生成失败，可能是今天没有聊天记录或配置错误。")
-
-    # --- Tool 入口 ---
-    @filter.llm_tool(name="group_summary_tool")
-    async def call_summary_tool(self, event: AstrMessageEvent):
-        """LLM调用工具"""
-        if self.global_bot is None:
-            self.global_bot = event.bot
-            
-        group_id = event.get_group_id()
-        yield event.plain_result(f"🌱 正在分析今日群聊内容...")
-        img_result = await self.generate_report(event.bot, group_id, silent=False)
-        if img_result:
-            yield event.image_result(img_result)
-        else:
-            yield event.plain_result("没有找到足够的聊天记录来生成总结。")
