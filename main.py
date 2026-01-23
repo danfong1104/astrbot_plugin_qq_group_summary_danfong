@@ -5,7 +5,7 @@ import time
 import datetime
 import traceback
 import asyncio
-import base64  # 新增 base64 库
+import base64
 from collections import Counter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -13,7 +13,6 @@ from apscheduler.triggers.cron import CronTrigger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-
 
 # 解析JSON
 def _parse_llm_json(text: str) -> dict:
@@ -31,7 +30,7 @@ def _parse_llm_json(text: str) -> dict:
     raise ValueError("无法从 LLM 回复中提取有效的 JSON 数据")
 
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "1.2.2")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "1.2.3")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -78,54 +77,66 @@ class GroupSummaryPlugin(Star):
 
     async def run_scheduled_task(self):
         """定时任务执行逻辑"""
-        logger.info("群聊总结(增强版): 开始执行定时推送任务...")
+        logger.info("群聊总结(增强版): [Step 1] 开始执行定时推送任务...")
         
-        # 获取一个可用的 Bot 实例
+        # 1. 获取 Bot 实例
         bots = self.context.get_bots()
         if not bots:
-            logger.warning("群聊总结(增强版): 未找到在线的 Bot 实例，跳过推送。")
+            logger.warning("群聊总结(增强版): [Error] 未找到在线的 Bot 实例，任务终止。")
             return
         
-        bot = list(bots.values())[0]
+        # 简单取第一个 Bot，通常就是你的 QQ 机器人
+        bot_id = list(bots.keys())[0]
+        bot = bots[bot_id]
+        logger.info(f"群聊总结(增强版): [Step 2] 使用 Bot 实例: {bot_id}")
         
         if not self.push_groups:
-            logger.warning("群聊总结(增强版): 推送列表为空，请在配置中添加 push_groups。")
+            logger.warning("群聊总结(增强版): [Error] 推送列表(push_groups)为空，请在配置中添加群号。")
             return
 
         for group_id in self.push_groups:
             g_id_str = str(group_id)
-            logger.info(f"群聊总结(增强版): 正在为群 {g_id_str} 生成总结...")
+            logger.info(f"群聊总结(增强版): [Step 3] 正在处理群: {g_id_str}")
             
+            # --- 测试连接性 (可选，确认 Bot 能在群里说话) ---
+            # await bot.api.call_action("send_group_msg", group_id=int(g_id_str), message=f"正在生成 {self.bot_name} 日报...")
+
             # 调用核心生成逻辑 (silent=True)
             img_path = await self.generate_report(bot, g_id_str, silent=True)
+            logger.info(f"群聊总结(增强版): [Step 4] 图片生成路径: {img_path}")
             
-            if img_path and os.path.exists(img_path):
-                try:
-                    # 关键修复：读取图片并转换为 Base64
-                    # 这样可以解决 Docker 容器路径不互通的问题
-                    with open(img_path, "rb") as image_file:
-                        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                    
-                    payload = {
-                        "group_id": int(g_id_str),
-                        "message": [
-                            {
-                                "type": "image",
-                                "data": {
-                                    "file": f"base64://{encoded_string}"
-                                }
-                            }
-                        ]
-                    }
-                    ret = await bot.api.call_action("send_group_msg", **payload)
-                    logger.info(f"群聊总结(增强版): 群 {g_id_str} 推送结果: {ret}")
-                except Exception as e:
-                    logger.error(f"群聊总结(增强版): 群 {g_id_str} 推送失败 (Error): {e}")
-                    logger.error(traceback.format_exc())
+            if img_path:
+                # --- 路径清理逻辑 ---
+                # 如果路径包含 file:// 前缀，Python 的 open() 无法直接读取，需要去掉
+                local_path = img_path
+                if local_path.startswith("file://"):
+                    local_path = local_path[7:]
+                # Windows 下 file:///C:/xxx 会变成 /C:/xxx，需要去掉开头的 /
+                if os.name == 'nt' and local_path.startswith('/') and ':' in local_path:
+                    local_path = local_path[1:]
+
+                if os.path.exists(local_path):
+                    try:
+                        logger.info(f"群聊总结(增强版): [Step 5] 正在读取文件并转码: {local_path}")
+                        with open(local_path, "rb") as image_file:
+                            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                        
+                        # 使用 CQ 码发送，兼容性更好
+                        cq_code = f"[CQ:image,file=base64://{encoded_string}]"
+                        
+                        logger.info(f"群聊总结(增强版): [Step 6] 正在调用 send_group_msg API...")
+                        ret = await bot.api.call_action("send_group_msg", group_id=int(g_id_str), message=cq_code)
+                        logger.info(f"群聊总结(增强版): [Success] 群 {g_id_str} 推送响应: {ret}")
+                        
+                    except Exception as e:
+                        logger.error(f"群聊总结(增强版): [Error] 群 {g_id_str} 推送过程发生异常: {e}")
+                        logger.error(traceback.format_exc())
+                else:
+                    logger.error(f"群聊总结(增强版): [Error] 找不到生成的图片文件: {local_path}")
             else:
-                logger.info(f"群聊总结(增强版): 群 {g_id_str} 生成失败或图片路径不存在，跳过推送。")
+                logger.info(f"群聊总结(增强版): [Skip] 群 {g_id_str} 生成返回为空(可能无消息)，跳过。")
             
-            # 避免触发风控
+            # 避免触发风控，暂停 5 秒
             await asyncio.sleep(5)
 
     def get_today_start_timestamp(self):
@@ -138,11 +149,9 @@ class GroupSummaryPlugin(Star):
         """分页获取群聊历史消息"""
         all_messages = []
         message_seq = 0
-        
-        # 使用传入的起始时间戳
         cutoff_time = start_timestamp
 
-        logger.info(f"群聊总结:开始获取群 {group_id} 消息，截止时间戳: {cutoff_time}")
+        # logger.info(f"群聊总结:开始获取群 {group_id} 消息，截止时间戳: {cutoff_time}")
 
         for round_idx in range(self.max_query_rounds):
             if len(all_messages) >= self.max_msg_count:
