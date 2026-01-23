@@ -8,6 +8,7 @@
             /* 配色方案：现代紫韵渐变 */
             --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             --accent-gradient: linear-gradient(90deg, #8E2DE2 0%, #4A00E0 100%);
+            --gold-gradient: linear-gradient(135deg, #f6d365 0%, #fda085 100%); /* 冠军金 */
             --text-dark: #1f1f1f;
             --text-gray: #666;
             --card-bg: rgba(255, 255, 255, 0.92);
@@ -33,7 +34,7 @@
             top: 0;
             left: 0;
             width: 100%;
-            height: 280px;
+            height: 260px;
             background: var(--primary-gradient);
             border-bottom-left-radius: 40px;
             border-bottom-right-radius: 40px;
@@ -46,12 +47,12 @@
             box-sizing: border-box;
         }
 
-        /* 头部设计 - 白色文字 */
+        /* 头部设计 */
         .header { 
             text-align: left; 
-            margin-bottom: 30px; 
+            margin-bottom: 25px; 
             color: #fff;
-            padding-top: 10px;
+            padding-top: 5px;
         }
         .header-date {
             font-size: 12px;
@@ -59,7 +60,7 @@
             letter-spacing: 1px;
             text-transform: uppercase;
             font-weight: 600;
-            margin-bottom: 5px;
+            margin-bottom: 8px;
             display: inline-block;
             background: rgba(255,255,255,0.15);
             padding: 4px 10px;
@@ -68,19 +69,20 @@
         }
         .header h1 { 
             margin: 0; 
-            font-size: 32px; 
+            font-size: 28px; 
             font-weight: 800;
             text-shadow: 0 4px 10px rgba(0,0,0,0.1);
-            line-height: 1.2;
+            line-height: 1.3;
         }
         .header-subtitle {
-            font-size: 14px;
-            opacity: 0.9;
+            font-size: 13px;
+            opacity: 0.85;
             margin-top: 5px;
             font-weight: 400;
+            letter-spacing: 1px;
         }
 
-        /* 卡片通用样式 - 毛玻璃感 */
+        /* 卡片通用样式 */
         .card { 
             background: var(--card-bg); 
             border-radius: 20px; 
@@ -92,7 +94,7 @@
             backdrop-filter: blur(10px);
         }
 
-        /* 标题设计 - 渐变文字 */
+        /* 标题设计 */
         .section-title {
             font-weight: 800;
             font-size: 18px;
@@ -103,7 +105,6 @@
             display: inline-block;
             position: relative;
         }
-        /* 标题下划线装饰 */
         .section-title::after {
             content: '';
             display: block;
@@ -117,52 +118,110 @@
             left: 0;
         }
 
-        /* 活跃之星 (Top Users) */
+        /* --- 排行榜设计 (重构) --- */
         .rank-list {
             display: flex;
             flex-direction: column;
-            gap: 15px;
+            gap: 12px;
         }
+        
         .rank-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 8px 10px;
+            border-radius: 12px;
+            transition: all 0.3s;
+        }
+
+        /* 名次图标/序号 */
+        .rank-badge {
+            width: 24px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             font-size: 14px;
+            font-weight: 800;
+            color: #888;
+        }
+
+        /* 内容区域 */
+        .rank-content {
+            flex: 1;
         }
         .rank-info {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 6px;
+            margin-bottom: 4px;
         }
         .rank-name {
-            font-weight: 700;
+            font-weight: 600;
+            font-size: 14px;
             color: #333;
         }
         .rank-count {
             font-size: 12px;
-            color: #888;
-            font-weight: 600;
-            background: #f0f0f5;
-            padding: 2px 8px;
-            border-radius: 10px;
+            color: #999;
+            font-weight: 500;
         }
+
         .rank-bar-bg {
-            height: 8px;
+            height: 6px;
             background: #f0f2f5;
-            border-radius: 4px;
+            border-radius: 3px;
             width: 100%;
             overflow: hidden;
         }
         .rank-bar-fill {
             height: 100%;
-            background: var(--accent-gradient);
-            border-radius: 4px;
-            box-shadow: 0 0 10px rgba(142, 45, 226, 0.4); /* 荧光效果 */
+            background: #ccc;
+            border-radius: 3px;
         }
-        /* 前三名特殊渐变 */
-        .rank-item:nth-child(1) .rank-bar-fill { background: linear-gradient(90deg, #FF9A9E 0%, #FECFEF 99%, #FECFEF 100%); box-shadow: 0 0 10px rgba(255, 154, 158, 0.5); }
-        .rank-item:nth-child(2) .rank-bar-fill { background: linear-gradient(90deg, #a18cd1 0%, #fbc2eb 100%); }
-        .rank-item:nth-child(3) .rank-bar-fill { background: linear-gradient(90deg, #84fab0 0%, #8fd3f4 100%); }
 
-        /* 话题流 (Timeline Style) */
+        /* --- 冠军 (第1名) 特殊样式 --- */
+        .rank-item.first-place {
+            background: linear-gradient(135deg, #fff6f6 0%, #fff 100%);
+            border: 1px solid #ffdecb;
+            box-shadow: 0 4px 15px rgba(255, 100, 100, 0.1);
+            padding: 15px; /* 加大内边距 */
+            transform: scale(1.02); /* 微微放大 */
+            margin-bottom: 5px;
+        }
+        .rank-item.first-place .rank-badge {
+            font-size: 28px; /* 奖牌图标放大 */
+            filter: drop-shadow(0 2px 4px rgba(255, 215, 0, 0.4));
+        }
+        .rank-item.first-place .rank-name {
+            font-size: 16px;
+            font-weight: 800;
+            color: #d35400; /* 深橙色 */
+        }
+        .rank-item.first-place .rank-count {
+            color: #e67e22;
+            background: rgba(255, 165, 0, 0.15);
+            padding: 2px 8px;
+            border-radius: 8px;
+        }
+        .rank-item.first-place .rank-bar-fill {
+            background: var(--gold-gradient); /* 金色进度条 */
+            box-shadow: 0 0 8px rgba(255, 165, 0, 0.5);
+        }
+
+        /* 第2名样式 */
+        .rank-item.second-place .rank-badge { font-size: 20px; }
+        .rank-item.second-place .rank-bar-fill { background: linear-gradient(90deg, #bdc3c7, #2c3e50); }
+        
+        /* 第3名样式 */
+        .rank-item.third-place .rank-badge { font-size: 20px; }
+        .rank-item.third-place .rank-bar-fill { background: linear-gradient(90deg, #e6b980, #eacda3); }
+
+        /* 4-5名通用 */
+        .rank-item.normal-place .rank-bar-fill { background: #a8a8a8; opacity: 0.5; }
+
+
+        /* 话题概览 (Timeline) */
         .topic-container {
             position: relative;
             padding-left: 20px;
@@ -174,7 +233,7 @@
             top: 8px;
             bottom: 8px;
             width: 3px;
-            background: linear-gradient(to bottom, #e0e0e0, #fff); /* 渐变线 */
+            background: linear-gradient(to bottom, #e0e0e0, #fff);
             border-radius: 3px;
         }
         .topic-item { 
@@ -184,7 +243,6 @@
         }
         .topic-item:last-child { margin-bottom: 0; }
         
-        /* 时间轴装饰点 */
         .topic-item::after {
             content: '';
             position: absolute;
@@ -203,14 +261,12 @@
             font-size: 13px; 
             font-weight: 800; 
             margin-bottom: 4px;
-            font-family: Consolas, Monaco, monospace;
+            font-family: "SF Mono", Consolas, monospace;
         }
 
-        /* 底部总结语 - 深色块风格 */
+        /* 底部评语 */
         .footer-note {
-            background: linear-gradient(135deg, #2c3e50, #4ca1af); /* 深蓝绿渐变 */
-            background: #240b36; /* 或深紫色 */
-            background: linear-gradient(to right, #240b36, #c31432); /* 强烈的深红紫渐变 */
+            background: linear-gradient(to right, #240b36, #c31432);
             color: #fff;
             border: none;
         }
@@ -230,11 +286,9 @@
             color: rgba(255, 255, 255, 0.9);
             text-shadow: 0 1px 2px rgba(0,0,0,0.2);
         }
-        /* 强制Markdown内文字颜色适配深色背景 */
         .footer-markdown strong { color: #ffeb3b; }
-        .footer-markdown p { margin-bottom: 8px; }
 
-        /* 版权区域 */
+        /* 版权 */
         .copyright {
             margin-top: 30px;
             text-align: center;
@@ -254,7 +308,7 @@
             font-size: 11px;
         }
 
-        /* Markdown 通用渲染修正 */
+        /* MD渲染修正 */
         .markdown-render p { margin: 0 0 6px 0; line-height: 1.6; }
         .markdown-render strong { color: #555; }
         .markdown-render code {
@@ -270,29 +324,37 @@
     <div class="container">
         <div class="header">
             <div class="header-date">📅 {{ date }}</div>
-            <h1>{{group_name}}</h1>
+            <h1>{{group_name}} 今日日报</h1>
             <div class="header-subtitle">DAILY INSIGHT REPORT</div>
         </div>
 
         <div class="card">
-            <div class="section-title">⚡ 活跃之星</div>
+            <div class="section-title">⚡ 活跃排行榜</div>
             <div class="rank-list">
                 {% for user in top_users %}
-                <div class="rank-item">
-                    <div class="rank-info">
-                        <span class="rank-name">{{ user.name }}</span>
-                        <span class="rank-count">{{ user.count }} msg</span>
+                <div class="rank-item {% if loop.index == 1 %}first-place{% elif loop.index == 2 %}second-place{% elif loop.index == 3 %}third-place{% else %}normal-place{% endif %}">
+                    
+                    <div class="rank-badge">
+                        {% if loop.index == 1 %}🥇{% elif loop.index == 2 %}🥈{% elif loop.index == 3 %}🥉{% else %}{{ loop.index }}{% endif %}
                     </div>
-                    <div class="rank-bar-bg">
-                        <div class="rank-bar-fill" style="width: {{ (user.count / top_users[0].count * 100) if top_users else 0 }}%;"></div>
+
+                    <div class="rank-content">
+                        <div class="rank-info">
+                            <span class="rank-name">{{ user.name }}</span>
+                            <span class="rank-count">{{ user.count }} msg</span>
+                        </div>
+                        <div class="rank-bar-bg">
+                            <div class="rank-bar-fill" style="width: {{ (user.count / top_users[0].count * 100) if top_users else 0 }}%;"></div>
+                        </div>
                     </div>
+
                 </div>
                 {% endfor %}
             </div>
         </div>
 
         <div class="card">
-            <div class="section-title">📌 话题时间轴</div>
+            <div class="section-title">📌 今日话题概览</div>
             <div class="topic-container">
                 {% for topic in topics %}
                 <div class="topic-item">
@@ -305,7 +367,7 @@
 
         <div class="card footer-note">
             <div class="bot-avatar-title">
-                <span>🤖 {{bot_name}} 观察日记</span>
+                <span>🤖 今日群聊评语</span>
             </div>
             <div class="footer-markdown" id="footer-content">{{ summary_text }}</div>
         </div>
@@ -325,7 +387,7 @@
                 el.innerHTML = marked.parse(rawMarkdown, { breaks: true });
             });
 
-            // 单独渲染底部的 Markdown (因为它的样式特殊)
+            // 单独渲染底部的 Markdown
             const footerEl = document.getElementById('footer-content');
             if(footerEl) {
                 const rawFooter = footerEl.innerHTML;
