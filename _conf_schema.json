@@ -7,7 +7,7 @@
             "max": 5000,
             "step": 100
         },
-        "default": 500
+        "default": 2000
     },
     "max_query_rounds": {
         "description": "获取群消息的最大轮数(轮)，每轮最多获取200条",
@@ -17,7 +17,7 @@
             "max": 100,
             "step": 10
         },
-        "default": 20
+        "default": 10
     },
       "token_limit": {
         "description": "单次查询的消息token限制",
@@ -27,7 +27,7 @@
             "max": 100000,
             "step": 2000
         },
-        "default": 15000
+        "default": 6000
     },
     "provider_id": {
         "description": "用于分析画像的LLM提供商",
@@ -60,5 +60,11 @@
         "description": "需要自动推送的群号列表",
         "type": "list",
         "default": []
+    },
+    "summary_prompt_style": {
+        "description": "总结语提示词(自定义Bot人设风格)",
+        "hint": "LLM将根据此提示生成最后的'悄悄话'，可用{bot_name}代表机器人名字",
+        "type": "string",
+        "default": "写一段“{bot_name}的悄悄话”作为总结，风格温暖、感性，对今天群里的氛围进行点评。"
     }
 }
