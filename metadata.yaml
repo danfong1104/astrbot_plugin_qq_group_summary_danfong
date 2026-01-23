@@ -1,6 +1,6 @@
 name: astrbot_plugin_qq_group_summary
 display_name: QQ群聊总结
-desc: QQ群聊总结，支持LLM TOOL调用。 # 插件简短描述
-version: v1.2.0
+desc: 基于zhoufan47的原版优化的群聊总结，支持每日定时推送、黑名单过滤、自定义人设风格及全新的UI设计。 
+version: v0.1.23
 author: danfong1104
 repo: https://github.com/danfong1104/astrbot_plugin_qq_group_summary_danfong
