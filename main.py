@@ -30,7 +30,7 @@ def _parse_llm_json(text: str) -> dict:
     raise ValueError("无法从 LLM 回复中提取有效的 JSON 数据")
 
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.23")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.24")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -81,9 +81,9 @@ class GroupSummaryPlugin(Star):
         except Exception as e:
             logger.error(f"群聊总结(增强版): 定时任务启动失败，请检查时间格式(HH:MM): {e}")
 
-    # --- 自动捕获 Bot 实例 ---
+    # --- 关键修复：增加 *args 以兼容不同版本的 AstrBot 事件分发 ---
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def capture_bot_instance(self, event: AstrMessageEvent):
+    async def capture_bot_instance(self, event: AstrMessageEvent, *args, **kwargs):
         """监听任意群消息以捕获 Bot 实例供定时任务使用"""
         if self.global_bot is None:
             self.global_bot = event.bot
@@ -326,11 +326,11 @@ class GroupSummaryPlugin(Star):
             logger.error(f"Render Error: {e}")
             return None
 
-    # --- 指令入口 (手动触发) ---
+    # --- 关键修复：增加 *args 以兼容不同版本的 AstrBot 指令调用 ---
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def summarize_group(self, event: AstrMessageEvent):
+    async def summarize_group(self, event: AstrMessageEvent, *args, **kwargs):
         """手动指令：/总结群聊"""
         # 只要手动触发，顺便也缓存一下 Bot
         if self.global_bot is None:
@@ -346,7 +346,7 @@ class GroupSummaryPlugin(Star):
 
     # --- Tool 入口 ---
     @filter.llm_tool(name="group_summary_tool")
-    async def call_summary_tool(self, event: AstrMessageEvent):
+    async def call_summary_tool(self, event: AstrMessageEvent, *args, **kwargs):
         """LLM调用工具"""
         if self.global_bot is None:
             self.global_bot = event.bot
