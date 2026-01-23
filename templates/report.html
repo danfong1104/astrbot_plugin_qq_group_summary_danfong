@@ -1,81 +1,302 @@
-import collections
-from typing import Dict, Deque
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        :root {
+            /* 配色方案：清新自然，带一点高级灰 */
+            --primary: #4a6fa5;      /* 主色调：静谧蓝 */
+            --primary-light: #eef2f7;
+            --accent: #ff8c42;       /* 强调色：暖橙 */
+            --bg-gradient: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            --card-bg: rgba(255, 255, 255, 0.95);
+            --text-main: #2d3436;
+            --text-sub: #636e72;
+            --shadow: 0 8px 30px rgba(0,0,0,0.06);
+            --radius: 16px;
+        }
 
-# 1. 规范导入
-from astrbot.api.all import *
-from astrbot.api.event import filter
-from astrbot.api import logger
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Source Han Sans", sans-serif;
+            background: var(--bg-gradient);
+            padding: 20px; 
+            width: 500px; 
+            box-sizing: border-box; 
+            margin: 0;
+            color: var(--text-main);
+            line-height: 1.5;
+        }
 
-@register("astrbot_plugin_qq_group_summary_danfong", "GroupSummary", "群聊总结插件", "1.0.0")
-class GroupSummaryPlugin(Star):
-    def __init__(self, context: Context, config: dict):
-        super().__init__(context)
-        self.config = config
-        
-        # 2. 获取配置中的长文本提示词 (默认值作为兜底)
-        default_prompt = "你是一个专业的群聊总结助手。请根据以下聊天记录，总结大家的讨论重点、有趣的梗以及活跃的话题。风格要轻松幽默，适当使用Emoji。"
-        self.summary_prompt = self.config.get("summary_prompt", default_prompt)
-        
-        # 聊天记录缓存：{group_id: [msg1, msg2...]}，每个群最多存 500 条
-        self.message_buffer: Dict[str, Deque[str]] = collections.defaultdict(lambda: collections.deque(maxlen=500))
+        .container {
+            width: 100%; 
+            background: transparent;
+            box-sizing: border-box;
+        }
 
-    # 监听群消息并记录
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def on_message(self, event: AstrMessageEvent):
-        if not event.message_obj.group_id:
-            return
-        
-        group_id = str(event.message_obj.group_id)
-        sender_name = event.message_obj.sender.nickname
-        content = event.message_str
-        
-        # 格式化记录: [张三]: 大家好
-        record = f"[{sender_name}]: {content}"
-        self.message_buffer[group_id].append(record)
+        /* 头部设计 */
+        .header { 
+            text-align: left; 
+            margin-bottom: 25px; 
+            padding: 0 10px;
+            position: relative;
+        }
+        .header-date {
+            font-size: 14px;
+            color: var(--text-sub);
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+        .header h1 { 
+            color: var(--text-main); 
+            margin: 5px 0 0 0; 
+            font-size: 28px; 
+            font-weight: 800;
+            background: linear-gradient(45deg, #2d3436, #4a6fa5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .header-badge {
+            display: inline-block;
+            background: var(--primary);
+            color: white;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 10px;
+            vertical-align: middle;
+            margin-left: 10px;
+        }
 
-    # 3. 总结指令
-    @filter.command("本群总结")
-    async def manual_summary(self, event: AstrMessageEvent):
-        group_id = str(event.message_obj.group_id)
-        
-        if group_id not in self.message_buffer or not self.message_buffer[group_id]:
-            yield event.plain_result("🚫 暂无聊天记录，请先聊几句吧！")
-            return
+        /* 通用卡片 */
+        .card { 
+            background: var(--card-bg); 
+            border-radius: var(--radius); 
+            padding: 20px; 
+            margin-bottom: 20px;
+            box-shadow: var(--shadow);
+            border: 1px solid rgba(255,255,255,0.6);
+            position: relative;
+            overflow: hidden;
+        }
 
-        yield event.plain_result("⏳ 正在根据您设定的【人格风格】生成总结，请稍候...")
-        
-        # 获取最近记录
-        records = list(self.message_buffer[group_id])
-        chat_history = "\n".join(records[-200:]) # 取最近200条防止超长
-        
-        # 4. 构建发给 LLM 的 Prompt (核心逻辑)
-        # 将配置的【人格提示词】与【聊天记录】拼接
-        final_prompt = (
-            f"{self.summary_prompt}\n\n"
-            f"---以下是聊天记录---\n"
-            f"{chat_history}\n"
-            f"---记录结束---\n"
-            f"请开始总结："
-        )
+        /* 标题栏 */
+        .section-title {
+            display: flex;
+            align-items: center;
+            font-weight: 700;
+            color: var(--text-main);
+            margin-bottom: 15px;
+            font-size: 16px;
+        }
+        .section-title::before {
+            content: "";
+            width: 4px;
+            height: 16px;
+            background: var(--accent);
+            border-radius: 2px;
+            margin-right: 8px;
+        }
 
-        # 调用 LLM
-        try:
-            # 使用 AstrBot 提供的 LLM 接口
-            provider = self.context.conversation.provider
-            if not provider:
-                 yield event.plain_result("❌ 未配置 LLM 模型，无法生成总结。")
-                 return
-                 
-            response = await provider.text_chat(final_prompt, session_id=None)
-            
-            # 发送结果
-            yield event.plain_result(response.completion_text)
-            
-        except Exception as e:
-            logger.error(f"总结生成失败: {e}")
-            yield event.plain_result(f"❌ 生成失败: {e}")
+        /* 活跃之星 (Top Users) */
+        .rank-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .rank-item {
+            display: flex;
+            align-items: center;
+            font-size: 13px;
+        }
+        .rank-info {
+            flex: 1;
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 3px;
+        }
+        .rank-bar-bg {
+            height: 6px;
+            background: #eee;
+            border-radius: 3px;
+            width: 100%;
+            overflow: hidden;
+        }
+        .rank-bar-fill {
+            height: 100%;
+            background: var(--primary);
+            border-radius: 3px;
+            transition: width 0.5s;
+        }
+        /* 前三名特殊颜色 */
+        .rank-item:nth-child(1) .rank-bar-fill { background: linear-gradient(90deg, #FFD700, #FDB931); }
+        .rank-item:nth-child(2) .rank-bar-fill { background: linear-gradient(90deg, #C0C0C0, #E0E0E0); }
+        .rank-item:nth-child(3) .rank-bar-fill { background: linear-gradient(90deg, #CD7F32, #D2691E); }
 
-    # 修复了你之前报错的函数 (现在作为类的方法存在，缩进正确)
-    async def generate_report(self, bot, group_id: str, silent: bool = False):
-        # 如果需要定时任务调用，可以在这里实现逻辑
-        pass
+        /* 话题流 (Timeline Style) */
+        .topic-container {
+            position: relative;
+            padding-left: 15px;
+        }
+        /* 时间轴线 */
+        .topic-container::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 10px;
+            bottom: 10px;
+            width: 2px;
+            background: #e0e0e0;
+        }
+        .topic-item { 
+            margin-bottom: 20px; 
+            position: relative; 
+            padding-left: 15px;
+        }
+        /* 时间轴圆点 */
+        .topic-item::after {
+            content: '';
+            position: absolute;
+            left: -20px;
+            top: 5px;
+            width: 8px;
+            height: 8px;
+            background: #fff;
+            border: 2px solid var(--primary);
+            border-radius: 50%;
+            z-index: 1;
+        }
+        .topic-time { 
+            color: var(--primary); 
+            font-size: 12px; 
+            font-weight: 700; 
+            background: var(--primary-light);
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            margin-bottom: 6px;
+        }
+
+        /* Markdown 内容微调 */
+        .markdown-render {
+            font-size: 14px; 
+            color: #444; 
+            line-height: 1.6;
+        }
+        .markdown-render p { margin: 0 0 5px 0; }
+        .markdown-render strong { color: #2d3436; font-weight: 700; }
+        .markdown-render code {
+            background: #f1f3f5; 
+            padding: 2px 5px; 
+            border-radius: 4px;
+            font-family: "SF Mono", Consolas, monospace; 
+            font-size: 0.9em; 
+            color: #d63384;
+        }
+
+        /* 悄悄话部分 - 模拟信纸效果 */
+        .footer-note {
+            background: #fffbf2; /* 暖色调背景 */
+            border: 1px solid #faeed7;
+            position: relative;
+        }
+        .footer-note::before {
+            content: "💡";
+            font-size: 20px;
+            position: absolute;
+            right: 15px;
+            top: 15px;
+            opacity: 0.2;
+        }
+        .bot-avatar-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+            color: #8d6e63;
+            font-weight: bold;
+            font-size: 14px;
+        }
+
+        /* 底部版权 */
+        .copyright {
+            margin-top: 25px;
+            text-align: center;
+        }
+        .copyright p {
+            margin: 2px 0;
+            font-size: 10px;
+            color: #999;
+            transform: scale(0.9);
+        }
+        .brand {
+            font-weight: 600;
+            color: var(--primary);
+            opacity: 0.7;
+        }
+
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="header-date">{{ date }} <span style="margin: 0 5px; opacity:0.3">|</span> DAILY REPORT</div>
+            <h1>{{group_name}} <span style="font-size:16px; font-weight:normal; color:#888;">回顾</span></h1>
+        </div>
+
+        <div class="card">
+            <div class="section-title">今日活跃之星</div>
+            <div class="rank-list">
+                {% for user in top_users %}
+                <div class="rank-item">
+                    <div style="width: 100%">
+                        <div class="rank-info">
+                            <span style="font-weight:600; color:#555">{{ user.name }}</span>
+                            <span style="color:var(--text-sub); font-size:11px;">{{ user.count }} msg</span>
+                        </div>
+                        <div class="rank-bar-bg">
+                            <div class="rank-bar-fill" style="width: {{ (user.count / top_users[0].count * 100) if top_users else 0 }}%;"></div>
+                        </div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="section-title">话题时间轴</div>
+            <div class="topic-container">
+                {% for topic in topics %}
+                <div class="topic-item">
+                    <div class="topic-time">{{ topic.time_range }}</div>
+                    <div class="markdown-render">{{ topic.summary }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div class="card footer-note">
+            <div class="bot-avatar-title">
+                <span>💬 {{bot_name}}的悄悄话</span>
+            </div>
+            <div class="markdown-render" style="color: #6d5c55;">{{ summary_text }}</div>
+        </div>
+
+        <div class="copyright">
+            <p>Generated by Group Summary Plugin (Danfong Edition)</p>
+            <p class="brand">Powered By AstrBot & Google Gemini</p>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            const elements = document.querySelectorAll('.markdown-render');
+            elements.forEach(el => {
+                const rawMarkdown = el.innerHTML;
+                const htmlContent = marked.parse(rawMarkdown, { breaks: true });
+                el.innerHTML = htmlContent;
+            });
+        });
+    </script>
+</body>
+</html>
