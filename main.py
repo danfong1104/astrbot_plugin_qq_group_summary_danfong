@@ -30,7 +30,7 @@ def _parse_llm_json(text: str) -> dict:
     raise ValueError("无法从 LLM 回复中提取有效的 JSON 数据")
 
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "1.2.7")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.23")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
