@@ -40,5 +40,25 @@
         "description": "BOT名称",
         "type": "string",
         "default": "BOT"
+    },
+    "exclude_users": {
+        "description": "排除用户列表(昵称)，这些用户的消息不参与统计",
+        "type": "list",
+        "default": []
+    },
+    "enable_auto_push": {
+        "description": "是否开启每日定时推送",
+        "type": "bool",
+        "default": false
+    },
+    "push_time": {
+        "description": "每日推送时间 (24小时制 HH:MM)",
+        "type": "string",
+        "default": "23:00"
+    },
+    "push_groups": {
+        "description": "需要自动推送的群号列表",
+        "type": "list",
+        "default": []
     }
 }
