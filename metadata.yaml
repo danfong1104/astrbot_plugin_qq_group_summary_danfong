@@ -2,5 +2,5 @@ name: astrbot_plugin_qq_group_summary
 display_name: QQ群聊总结
 desc: QQ群聊总结，支持LLM TOOL调用。 # 插件简短描述
 version: v1.1.5
-author: 棒棒糖
-repo: https://github.com/zhoufan47/astrbot_plugin_qq_group_summary
+author: danfong1104
+repo: https://github.com/danfong1104/astrbot_plugin_qq_group_summary_danfong
