@@ -5,110 +5,286 @@
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
         :root {
-            --primary: #6c9e6d;
-            --bg: #fdfdfd;
-            --card-bg: #f4f8f4;
-            --text-main: #333;
-            --text-sub: #888;
+            /* 配色方案：清新自然，带一点高级灰 */
+            --primary: #4a6fa5;      /* 主色调：静谧蓝 */
+            --primary-light: #eef2f7;
+            --accent: #ff8c42;       /* 强调色：暖橙 */
+            --bg-gradient: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            --card-bg: rgba(255, 255, 255, 0.95);
+            --text-main: #2d3436;
+            --text-sub: #636e72;
+            --shadow: 0 8px 30px rgba(0,0,0,0.06);
+            --radius: 16px;
         }
-        body { font-family: "Source Han Sans", sans-serif; background: #eee; padding: 20px; width: 500px; box-sizing: border-box; margin: 0;}
+
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Source Han Sans", sans-serif;
+            background: var(--bg-gradient);
+            padding: 20px; 
+            width: 500px; 
+            box-sizing: border-box; 
+            margin: 0;
+            color: var(--text-main);
+            line-height: 1.5;
+        }
+
         .container {
-            width: 100%; background: var(--bg); padding: 20px;
-            border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.05);
-            border: 1px dashed #ccc;
+            width: 100%; 
+            background: transparent;
             box-sizing: border-box;
         }
-        .header { text-align: center; margin-bottom: 20px; }
-        .header h1 { color: var(--primary); margin: 0; font-size: 24px; }
-        .header p { color: var(--text-sub); font-size: 12px; margin-top: 5px; }
+
+        /* 头部设计 */
+        .header { 
+            text-align: left; 
+            margin-bottom: 25px; 
+            padding: 0 10px;
+            position: relative;
+        }
+        .header-date {
+            font-size: 14px;
+            color: var(--text-sub);
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+        .header h1 { 
+            color: var(--text-main); 
+            margin: 5px 0 0 0; 
+            font-size: 28px; 
+            font-weight: 800;
+            background: linear-gradient(45deg, #2d3436, #4a6fa5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .header-badge {
+            display: inline-block;
+            background: var(--primary);
+            color: white;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 10px;
+            vertical-align: middle;
+            margin-left: 10px;
+        }
+
+        /* 通用卡片 */
+        .card { 
+            background: var(--card-bg); 
+            border-radius: var(--radius); 
+            padding: 20px; 
+            margin-bottom: 20px;
+            box-shadow: var(--shadow);
+            border: 1px solid rgba(255,255,255,0.6);
+            position: relative;
+            overflow: hidden;
+        }
+
+        /* 标题栏 */
         .section-title {
-            border-left: 4px solid var(--primary);
-            padding-left: 10px; font-weight: bold; color: var(--text-main);
-            margin: 25px 0 15px 0; font-size: 16px;
+            display: flex;
+            align-items: center;
+            font-weight: 700;
+            color: var(--text-main);
+            margin-bottom: 15px;
+            font-size: 16px;
         }
-        .stats-box { display: flex; gap: 10px; }
-        .card { background: var(--card-bg); border-radius: 8px; padding: 10px; flex: 1; }
-        .user-row { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 6px; }
-        .chart { display: flex; align-items: flex-end; height: 100px; gap: 4px; padding-top:10px;}
-        .bar { background: #c8e6c9; flex: 1; border-radius: 3px 3px 0 0; transition: height 0.3s; }
-        .bar:nth-child(even) { background: #a5d6a7; }
-
-        .topic-item { margin-bottom: 15px; position: relative; padding-left: 15px; }
-        .topic-item::before {
-            content: "•"; color: var(--primary); position: absolute; left: 0; font-size: 20px; line-height: 14px;
+        .section-title::before {
+            content: "";
+            width: 4px;
+            height: 16px;
+            background: var(--accent);
+            border-radius: 2px;
+            margin-right: 8px;
         }
-        .topic-time { color: var(--primary); font-size: 12px; font-weight: bold; }
 
+        /* 活跃之星 (Top Users) */
+        .rank-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .rank-item {
+            display: flex;
+            align-items: center;
+            font-size: 13px;
+        }
+        .rank-info {
+            flex: 1;
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 3px;
+        }
+        .rank-bar-bg {
+            height: 6px;
+            background: #eee;
+            border-radius: 3px;
+            width: 100%;
+            overflow: hidden;
+        }
+        .rank-bar-fill {
+            height: 100%;
+            background: var(--primary);
+            border-radius: 3px;
+            transition: width 0.5s;
+        }
+        /* 前三名特殊颜色 */
+        .rank-item:nth-child(1) .rank-bar-fill { background: linear-gradient(90deg, #FFD700, #FDB931); }
+        .rank-item:nth-child(2) .rank-bar-fill { background: linear-gradient(90deg, #C0C0C0, #E0E0E0); }
+        .rank-item:nth-child(3) .rank-bar-fill { background: linear-gradient(90deg, #CD7F32, #D2691E); }
+
+        /* 话题流 (Timeline Style) */
+        .topic-container {
+            position: relative;
+            padding-left: 15px;
+        }
+        /* 时间轴线 */
+        .topic-container::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 10px;
+            bottom: 10px;
+            width: 2px;
+            background: #e0e0e0;
+        }
+        .topic-item { 
+            margin-bottom: 20px; 
+            position: relative; 
+            padding-left: 15px;
+        }
+        /* 时间轴圆点 */
+        .topic-item::after {
+            content: '';
+            position: absolute;
+            left: -20px;
+            top: 5px;
+            width: 8px;
+            height: 8px;
+            background: #fff;
+            border: 2px solid var(--primary);
+            border-radius: 50%;
+            z-index: 1;
+        }
+        .topic-time { 
+            color: var(--primary); 
+            font-size: 12px; 
+            font-weight: 700; 
+            background: var(--primary-light);
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            margin-bottom: 6px;
+        }
+
+        /* Markdown 内容微调 */
         .markdown-render {
-            font-size: 13px; color: #444; margin-top: 4px; line-height: 1.6;
+            font-size: 14px; 
+            color: #444; 
+            line-height: 1.6;
         }
         .markdown-render p { margin: 0 0 5px 0; }
-        .markdown-render strong { color: #2e7d32; font-weight: 700; }
+        .markdown-render strong { color: #2d3436; font-weight: 700; }
         .markdown-render code {
-            background: #f0f0f0; padding: 2px 4px; border-radius: 4px;
-            font-family: Consolas, monospace; font-size: 0.9em; color: #c62828;
+            background: #f1f3f5; 
+            padding: 2px 5px; 
+            border-radius: 4px;
+            font-family: "SF Mono", Consolas, monospace; 
+            font-size: 0.9em; 
+            color: #d63384;
         }
-        .markdown-render ul { margin: 5px 0; padding-left: 20px; }
 
+        /* 悄悄话部分 - 模拟信纸效果 */
         .footer-note {
-            background: #fff8e1; border: 1px solid #ffe0b2;
-            border-radius: 10px; padding: 15px; font-size: 13px; color: #795548;
-            margin-top: 30px; position: relative;
+            background: #fffbf2; /* 暖色调背景 */
+            border: 1px solid #faeed7;
+            position: relative;
         }
+        .footer-note::before {
+            content: "💡";
+            font-size: 20px;
+            position: absolute;
+            right: 15px;
+            top: 15px;
+            opacity: 0.2;
+        }
+        .bot-avatar-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+            color: #8d6e63;
+            font-weight: bold;
+            font-size: 14px;
+        }
+
+        /* 底部版权 */
         .copyright {
-            margin-top: 30px;
+            margin-top: 25px;
             text-align: center;
-            border-top: 1px dashed #e0e0e0;
-            padding-top: 15px;
         }
         .copyright p {
-            margin: 3px 0;
+            margin: 2px 0;
             font-size: 10px;
-            color: #aaa;
-            font-family: Consolas, "Microsoft YaHei", sans-serif;
-        }
-        .copyright .brand {
-            font-weight: bold;
             color: #999;
+            transform: scale(0.9);
         }
-        .footer-note::before { content: "🌱"; position: absolute; top: -10px; left: 15px; background: #fff8e1; padding: 0 5px;}
+        .brand {
+            font-weight: 600;
+            color: var(--primary);
+            opacity: 0.7;
+        }
+
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>{{group_name}} 今日热点回顾</h1>
-            <p>观察日记 ({{ date }})</p>
+            <div class="header-date">{{ date }} <span style="margin: 0 5px; opacity:0.3">|</span> DAILY REPORT</div>
+            <h1>{{group_name}} <span style="font-size:16px; font-weight:normal; color:#888;">回顾</span></h1>
         </div>
 
-        <div class="stats-box">
-            <div class="card">
-                <div style="color:var(--primary); font-weight:bold; margin-bottom:8px;">🌿 活跃之星 Top 5</div>
+        <div class="card">
+            <div class="section-title">今日活跃之星</div>
+            <div class="rank-list">
                 {% for user in top_users %}
-                <div class="user-row">
-                    <span style="font-weight:bold; color:#555">{{ user.name }}</span>
-                    <span style="color:var(--primary)">{{ user.count }}条</span>
+                <div class="rank-item">
+                    <div style="width: 100%">
+                        <div class="rank-info">
+                            <span style="font-weight:600; color:#555">{{ user.name }}</span>
+                            <span style="color:var(--text-sub); font-size:11px;">{{ user.count }} msg</span>
+                        </div>
+                        <div class="rank-bar-bg">
+                            <div class="rank-bar-fill" style="width: {{ (user.count / top_users[0].count * 100) if top_users else 0 }}%;"></div>
+                        </div>
+                    </div>
                 </div>
                 {% endfor %}
             </div>
         </div>
 
-        <div class="section-title">今日话题总结</div>
-        {% for topic in topics %}
-        <div class="topic-item">
-            <div class="topic-time">{{ topic.time_range }}</div>
-            <div class="markdown-render">{{ topic.summary }}</div>
+        <div class="card">
+            <div class="section-title">话题时间轴</div>
+            <div class="topic-container">
+                {% for topic in topics %}
+                <div class="topic-item">
+                    <div class="topic-time">{{ topic.time_range }}</div>
+                    <div class="markdown-render">{{ topic.summary }}</div>
+                </div>
+                {% endfor %}
+            </div>
         </div>
-        {% endfor %}
 
-        <div class="footer-note">
-            <strong>{{bot_name}}的悄悄话：</strong><br>
-            <div class="markdown-render" style="margin-top:5px;">{{ summary_text }}</div>
+        <div class="card footer-note">
+            <div class="bot-avatar-title">
+                <span>💬 {{bot_name}}的悄悄话</span>
+            </div>
+            <div class="markdown-render" style="color: #6d5c55;">{{ summary_text }}</div>
         </div>
+
         <div class="copyright">
-            <p>Generated by QQ群总结工具-danfong修改版</p>
-            <p class="brand">Powered By zhoufan47 & AstrBot & Google Gemini 3.0 </p>
-            <p>Inspired by zhoufan47 & danfong1104</p>
+            <p>Generated by Group Summary Plugin (Danfong Edition)</p>
+            <p class="brand">Powered By AstrBot & Google Gemini</p>
         </div>
     </div>
 
