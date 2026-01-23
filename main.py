@@ -14,7 +14,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
-# 解析JSON (保持不变)
+# 解析JSON
 def _parse_llm_json(text: str) -> dict:
     try:
         return json.loads(text)
@@ -30,7 +30,7 @@ def _parse_llm_json(text: str) -> dict:
     raise ValueError("无法从 LLM 回复中提取有效的 JSON 数据")
 
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "1.2.4")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "1.2.5")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -47,6 +47,9 @@ class GroupSummaryPlugin(Star):
         self.enable_auto_push = self.config.get("enable_auto_push", False)
         self.push_time = self.config.get("push_time", "23:00")
         self.push_groups = self.config.get("push_groups", [])
+
+        # 全局 Bot 实例缓存
+        self.global_bot = None
 
         # 加载模板
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -75,31 +78,27 @@ class GroupSummaryPlugin(Star):
         except Exception as e:
             logger.error(f"群聊总结(增强版): 定时任务启动失败，请检查时间格式(HH:MM): {e}")
 
+    # --- 关键修复：自动捕获 Bot 实例 ---
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def capture_bot_instance(self, event: AstrMessageEvent):
+        """监听任意群消息以捕获 Bot 实例供定时任务使用"""
+        if self.global_bot is None:
+            self.global_bot = event.bot
+            logger.info(f"群聊总结(增强版): 已成功捕获 Bot 实例，定时任务准备就绪。")
+
     async def run_scheduled_task(self):
-        """定时任务执行逻辑 (Debug版)"""
-        # 全局异常捕获，防止 APScheduler 吞掉错误
+        """定时任务执行逻辑"""
         try:
             logger.info("群聊总结(增强版): [Step 1] 开始执行定时推送任务...")
             
-            # 1. 获取 Bot 实例
-            # 这里加一个调试打印，看看 self.context 是否正常
-            if self.context is None:
-                logger.error("群聊总结(增强版): [Fatal Error] self.context 为 None！无法获取 Bot。")
+            # 1. 检查 Bot 实例
+            if self.global_bot is None:
+                logger.warning("群聊总结(增强版): [Warning] 尚未捕获到 Bot 实例。")
+                logger.warning("请确保 Bot 启动后至少接收到过一条群消息（任意群）。本次任务跳过。")
                 return
 
-            bots = self.context.get_bots()
-            
-            # 打印 bots 的类型和长度，确认获取情况
-            logger.info(f"群聊总结(增强版): [Debug] 获取到的 bots 类型: {type(bots)}, 数量: {len(bots) if bots else 0}")
-
-            if not bots:
-                logger.warning("群聊总结(增强版): [Error] 未找到在线的 Bot 实例 (bots 为空)，任务终止。")
-                return
-            
-            # 简单取第一个 Bot
-            bot_id = list(bots.keys())[0]
-            bot = bots[bot_id]
-            logger.info(f"群聊总结(增强版): [Step 2] 使用 Bot 实例: {bot_id}")
+            bot = self.global_bot
+            logger.info(f"群聊总结(增强版): [Step 2] 使用 Bot 实例进行推送")
             
             if not self.push_groups:
                 logger.warning("群聊总结(增强版): [Error] 推送列表(push_groups)为空，请在配置中添加群号。")
@@ -127,6 +126,7 @@ class GroupSummaryPlugin(Star):
                             with open(local_path, "rb") as image_file:
                                 encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
                             
+                            # 使用 CQ 码发送，兼容性更好
                             cq_code = f"[CQ:image,file=base64://{encoded_string}]"
                             
                             logger.info(f"群聊总结(增强版): [Step 6] 正在调用 send_group_msg API...")
@@ -310,6 +310,10 @@ class GroupSummaryPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def summarize_group(self, event: AstrMessageEvent):
         """手动指令：/总结群聊"""
+        # 只要手动触发，顺便也缓存一下 Bot
+        if self.global_bot is None:
+            self.global_bot = event.bot
+            
         group_id = event.get_group_id()
         yield event.plain_result(f"🌱 正在回溯今日记忆...")
         img_result = await self.generate_report(event.bot, group_id, silent=False)
@@ -322,6 +326,9 @@ class GroupSummaryPlugin(Star):
     @filter.llm_tool(name="group_summary_tool")
     async def call_summary_tool(self, event: AstrMessageEvent):
         """LLM调用工具"""
+        if self.global_bot is None:
+            self.global_bot = event.bot
+            
         group_id = event.get_group_id()
         yield event.plain_result(f"🌱 正在分析今日群聊内容...")
         img_result = await self.generate_report(event.bot, group_id, silent=False)
