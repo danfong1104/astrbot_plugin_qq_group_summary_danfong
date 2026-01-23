@@ -64,7 +64,7 @@
     "summary_prompt_style": {
         "description": "总结语提示词(自定义Bot人设风格)",
         "hint": "LLM将根据此提示生成最后的'悄悄话'，可用{bot_name}代表机器人名字",
-        "type": "string",
+        "type": "text",
         "default": "写一段“{bot_name}的悄悄话”作为总结，风格温暖、感性，对今天群里的氛围进行点评。"
     }
 }
