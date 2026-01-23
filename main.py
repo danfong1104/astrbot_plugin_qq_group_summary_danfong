@@ -17,16 +17,13 @@ from astrbot.api import logger
 def _parse_llm_json(text: str) -> dict:
     """增强型 JSON 解析器"""
     text = text.strip()
-    # 尝试去除 markdown 代码块标记
     if text.startswith("```"):
         text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE | re.DOTALL).strip()
-    
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
     try:
-        # 正则提取最外层的 {}
         match = re.search(r"\{[\s\S]*\}", text)
         if match:
             json_str = match.group()
@@ -35,7 +32,7 @@ def _parse_llm_json(text: str) -> dict:
         pass
     raise ValueError(f"无法提取有效 JSON，原始文本: {text[:50]}...")
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.26")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.27")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -62,7 +59,7 @@ class GroupSummaryPlugin(Star):
         try:
             with open(template_path, "r", encoding="utf-8") as f:
                 self.html_template = f.read()
-            logger.info(f"群聊总结(增强版): 模板加载成功 | v0.1.26 Reloaded")
+            logger.info(f"群聊总结(增强版): 模板加载成功 | v0.1.27 HotFix")
         except FileNotFoundError:
             logger.error(f"群聊总结(增强版): 模板文件丢失: {template_path}")
             self.html_template = "<h1>Template Not Found</h1>"
@@ -73,10 +70,11 @@ class GroupSummaryPlugin(Star):
             self.setup_schedule()
 
     def setup_schedule(self):
+        """配置定时任务"""
         try:
             if self.scheduler.running:
                 self.scheduler.shutdown()
-            self.scheduler = AsyncIOScheduler() # 重新创建实例以防万一
+            self.scheduler = AsyncIOScheduler()
             
             hour, minute = self.push_time.split(":")
             trigger = CronTrigger(hour=int(hour), minute=int(minute))
@@ -87,23 +85,22 @@ class GroupSummaryPlugin(Star):
             logger.error(f"群聊总结(增强版): 定时任务启动失败: {e}")
 
     def terminate(self):
-        """AstrBot 插件卸载/重载时的钩子"""
+        """AstrBot 插件卸载/重载时的钩子 (支持热重启)"""
         try:
             if self.scheduler.running:
                 self.scheduler.shutdown()
-                logger.info("群聊总结(增强版): 定时任务已停止 (插件重载)")
+                logger.info("群聊总结(增强版): 定时任务已停止 (资源清理)")
         except Exception as e:
             logger.error(f"群聊总结(增强版): 资源清理失败: {e}")
 
-    # ================= 监听与捕获 =================
-    
-    # 使用 *args, **kwargs 接收所有多余参数，防止 TypeError
+    # ================= 监听与捕获 (参数兼容性修复) =================
+    # 使用 *args, **kwargs 完美兼容 AstrBot 的调用，并不干扰指令解析器
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def capture_bot_instance(self, event: AstrMessageEvent, *args, **kwargs):
         """被动监听：捕获 Bot 实例"""
         if self.global_bot is None:
             self.global_bot = event.bot
-            # logger.info(f"群聊总结(增强版): Bot实例已捕获 (Event监听)")
 
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -119,7 +116,7 @@ class GroupSummaryPlugin(Star):
         if img_result:
             yield event.image_result(img_result)
         else:
-            yield event.plain_result("❌ 总结生成失败，可能是记录为空或LLM多次重试失败。")
+            yield event.plain_result("❌ 总结生成失败，可能是记录为空或 LLM 多次重试失败。")
 
     @filter.llm_tool(name="group_summary_tool")
     async def call_summary_tool(self, event: AstrMessageEvent, *args, **kwargs):
@@ -144,7 +141,6 @@ class GroupSummaryPlugin(Star):
             
             if self.global_bot is None:
                 logger.warning("群聊总结(增强版): [Warning] 未捕获 Bot 实例。")
-                logger.warning("提示：因其他插件可能拦截事件，请手动发送指令 /总结群聊 一次，或确保 Bot 收到一条未报错的普通消息。")
                 return
 
             bot = self.global_bot
@@ -331,10 +327,8 @@ class GroupSummaryPlugin(Star):
 
         for attempt in range(3):
             try:
-                # 稍微加一点随机性或等待，避免速率限制
                 if attempt > 0:
-                    logger.warning(f"LLM 解析失败，正在重试 ({attempt+1}/3)...")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(1) # 稍作等待
 
                 response = await provider.text_chat(prompt, session_id=None)
                 if not response or not response.completion_text:
@@ -342,11 +336,10 @@ class GroupSummaryPlugin(Star):
                     
                 analysis_data = _parse_llm_json(response.completion_text)
                 if analysis_data:
-                    break # 成功获取，跳出循环
+                    break 
             except Exception as e:
                 logger.error(f"LLM Error (Attempt {attempt+1}): {e}")
         
-        # 如果3次都失败
         if not analysis_data:
             analysis_data = {"topics": [], "closing_remark": "总结生成失败 (LLM 返回数据格式错误或超时)。"}
         # ====================================================
