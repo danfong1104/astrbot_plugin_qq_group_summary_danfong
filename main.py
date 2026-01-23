@@ -28,7 +28,7 @@ def _parse_llm_json(text: str) -> dict:
         pass
     raise ValueError("无法从 LLM 回复中提取有效的 JSON 数据")
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.23")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.25")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -55,41 +55,56 @@ class GroupSummaryPlugin(Star):
         try:
             with open(template_path, "r", encoding="utf-8") as f:
                 self.html_template = f.read()
-            logger.info(f"群聊总结(增强版): 模板加载成功 | v0.1.23 Load Success")
+            logger.info(f"群聊总结(增强版): 模板加载成功 | v0.1.25 Reloaded")
         except FileNotFoundError:
             logger.error(f"群聊总结(增强版): 模板文件丢失: {template_path}")
             self.html_template = "<h1>Template Not Found</h1>"
 
-        # 定时任务
+        # 定时任务初始化
         self.scheduler = AsyncIOScheduler()
         if self.enable_auto_push:
             self.setup_schedule()
 
     def setup_schedule(self):
         try:
+            if self.scheduler.running:
+                self.scheduler.shutdown()
+                self.scheduler = AsyncIOScheduler()
+            
             hour, minute = self.push_time.split(":")
             trigger = CronTrigger(hour=int(hour), minute=int(minute))
             self.scheduler.add_job(self.run_scheduled_task, trigger)
             self.scheduler.start()
-            logger.info(f"群聊总结(增强版): 定时推送已就绪 -> 每天 {self.push_time} 推送至 {self.push_groups}")
+            logger.info(f"群聊总结(增强版): 定时任务已启动 -> 每天 {self.push_time}")
         except Exception as e:
             logger.error(f"群聊总结(增强版): 定时任务启动失败: {e}")
 
-    # ================= 核心修复区域 =================
-    # 必须加上 *args, **kwargs 以兼容 AstrBot 传入的额外上下文参数
-    
+    # --- 热重启资源清理 ---
+    def terminate(self):
+        """AstrBot 插件卸载/重载时的钩子"""
+        try:
+            if self.scheduler.running:
+                self.scheduler.shutdown()
+                logger.info("群聊总结(增强版): 定时任务已停止 (插件重载/卸载)")
+        except Exception as e:
+            logger.error(f"群聊总结(增强版): 资源清理失败: {e}")
+
+    # ================= 关键修复：参数兼容性设计 =================
+    # 使用 context=None 既能接收 AstrBot 传入的参数，又会被视为可选参数，避免“参数缺失”报错
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def capture_bot_instance(self, event: AstrMessageEvent, *args, **kwargs):
-        """自动捕获 Bot 实例"""
+    async def capture_bot_instance(self, event: AstrMessageEvent, context=None):
+        """被动监听：捕获 Bot 实例"""
         if self.global_bot is None:
             self.global_bot = event.bot
-            logger.info(f"群聊总结(增强版): Bot实例捕获成功，定时任务准备就绪。")
+            # 仅在首次捕获时打印，避免刷屏
+            # logger.info(f"群聊总结(增强版): Bot实例已捕获 (Event监听)")
 
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def summarize_group(self, event: AstrMessageEvent, *args, **kwargs):
-        """手动指令"""
+    async def summarize_group(self, event: AstrMessageEvent, context=None):
+        """手动指令：捕获 Bot 并执行"""
         if self.global_bot is None:
             self.global_bot = event.bot
             
@@ -102,8 +117,8 @@ class GroupSummaryPlugin(Star):
             yield event.plain_result("❌ 总结生成失败，可能是记录为空或鉴权失败。")
 
     @filter.llm_tool(name="group_summary_tool")
-    async def call_summary_tool(self, event: AstrMessageEvent, *args, **kwargs):
-        """LLM调用工具"""
+    async def call_summary_tool(self, event: AstrMessageEvent, context=None):
+        """LLM调用：捕获 Bot 并执行"""
         if self.global_bot is None:
             self.global_bot = event.bot
             
@@ -115,7 +130,7 @@ class GroupSummaryPlugin(Star):
         else:
             yield event.plain_result("无法生成总结。")
             
-    # ===============================================
+    # =========================================================
 
     async def run_scheduled_task(self):
         """定时任务逻辑"""
@@ -123,12 +138,12 @@ class GroupSummaryPlugin(Star):
             logger.info("群聊总结(增强版): [Step 1] 开始定时推送...")
             
             if self.global_bot is None:
-                logger.warning("群聊总结(增强版): [Warning] 未捕获 Bot 实例，跳过本次推送。请确保 Bot 启动后收到过至少一条群消息。")
+                logger.warning("群聊总结(增强版): [Warning] 未捕获 Bot 实例。请确保插件加载后，Bot 收到过至少一条群消息（任意群）。")
                 return
 
             bot = self.global_bot
             if not self.push_groups:
-                logger.warning("群聊总结(增强版): 推送列表为空。")
+                logger.warning("群聊总结(增强版): 推送列表为空，请检查配置 push_groups。")
                 return
 
             for group_id in self.push_groups:
