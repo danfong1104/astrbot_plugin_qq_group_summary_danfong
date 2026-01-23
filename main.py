@@ -30,7 +30,7 @@ def _parse_llm_json(text: str) -> dict:
     raise ValueError("无法从 LLM 回复中提取有效的 JSON 数据")
 
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "1.2.0")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "1.2.1")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -79,33 +79,41 @@ class GroupSummaryPlugin(Star):
         """定时任务执行逻辑"""
         logger.info("群聊总结(增强版): 开始执行定时推送任务...")
         
-        # 获取一个可用的 Bot 实例 (通常取第一个)
+        # 获取一个可用的 Bot 实例
         bots = self.context.get_bots()
         if not bots:
             logger.warning("群聊总结(增强版): 未找到在线的 Bot 实例，跳过推送。")
             return
         
-        # 这里简单取第一个 bot，如果需要特定 bot 推送特定群，需要更复杂的逻辑
         bot = list(bots.values())[0]
+        
+        if not self.push_groups:
+            logger.warning("群聊总结(增强版): 推送列表为空，请在配置中添加 push_groups。")
+            return
 
         for group_id in self.push_groups:
-            # 确保 group_id 是字符串
             g_id_str = str(group_id)
             logger.info(f"群聊总结(增强版): 正在为群 {g_id_str} 生成总结...")
             
             # 调用核心生成逻辑 (silent=True)
-            img_result = await self.generate_report(bot, g_id_str, hours=24, silent=True)
+            img_path = await self.generate_report(bot, g_id_str, silent=True)
             
-            if img_result:
+            if img_path:
                 try:
-                    # 发送图片
+                    # 关键修复：OneBot v11 发送本地图片通常需要 file:// 前缀
+                    # AstrBot 的 html_render 返回的是绝对路径
+                    if not img_path.startswith("file://") and not img_path.startswith("http"):
+                         final_file_path = f"file://{img_path}"
+                    else:
+                         final_file_path = img_path
+
                     payload = {
                         "group_id": int(g_id_str),
                         "message": [
                             {
                                 "type": "image",
                                 "data": {
-                                    "file": img_result
+                                    "file": final_file_path
                                 }
                             }
                         ]
@@ -114,17 +122,27 @@ class GroupSummaryPlugin(Star):
                     logger.info(f"群聊总结(增强版): 群 {g_id_str} 推送成功。")
                 except Exception as e:
                     logger.error(f"群聊总结(增强版): 群 {g_id_str} 推送失败: {e}")
+            else:
+                logger.info(f"群聊总结(增强版): 群 {g_id_str} 无内容生成，跳过推送。")
             
-            # 避免触发风控，群与群之间暂停几秒
+            # 避免触发风控
             await asyncio.sleep(5)
 
-    async def fetch_group_history(self, bot, group_id: str, hours_limit: int = 24):
+    def get_today_start_timestamp(self):
+        """获取当天0点的时间戳"""
+        now = datetime.datetime.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return today_start.timestamp()
+
+    async def fetch_group_history(self, bot, group_id: str, start_timestamp: float):
         """分页获取群聊历史消息"""
         all_messages = []
         message_seq = 0
-        cutoff_time = time.time() - (hours_limit * 3600)
+        
+        # 使用传入的起始时间戳
+        cutoff_time = start_timestamp
 
-        logger.info(f"群聊总结:开始获取群 {group_id} 消息，目标上限: {self.max_msg_count}条 / {self.max_query_rounds}轮")
+        logger.info(f"群聊总结:开始获取群 {group_id} 消息，截止时间戳: {cutoff_time}")
 
         for round_idx in range(self.max_query_rounds):
             if len(all_messages) >= self.max_msg_count:
@@ -155,6 +173,7 @@ class GroupSummaryPlugin(Star):
                 
                 all_messages.extend(batch_msgs)
 
+                # 如果这批消息里最新的都已经比截止时间早了，或者最旧的碰到了截止线
                 if oldest_msg_time < cutoff_time:
                     break
             except Exception as e:
@@ -163,9 +182,9 @@ class GroupSummaryPlugin(Star):
 
         return all_messages
 
-    def process_messages(self, messages: list, hours_limit: int = 24):
+    def process_messages(self, messages: list, start_timestamp: float):
         """处理消息并进行黑名单过滤"""
-        cutoff_time = time.time() - (hours_limit * 3600)
+        cutoff_time = start_timestamp
         valid_msgs = []
         user_counter = Counter()
         trend_counter = Counter()
@@ -177,16 +196,15 @@ class GroupSummaryPlugin(Star):
 
             # 过滤系统消息
             raw_msg = msg.get("raw_message", "")
-            if "[CQ:" in raw_msg and "image" in raw_msg: # 简单过滤图片
+            if "[CQ:" in raw_msg and "image" in raw_msg: 
                 pass
             
             sender = msg.get("sender", {})
             nickname = sender.get("card") or sender.get("nickname") or "未知用户"
             
-            # --- 黑名单过滤 (新增功能) ---
+            # 黑名单过滤
             if nickname in self.exclude_users:
                 continue
-            # 也可以根据 sender['user_id'] 过滤，如需支持QQ号过滤可扩展
             
             content = raw_msg
 
@@ -202,45 +220,50 @@ class GroupSummaryPlugin(Star):
 
         top_users = [{"name": name, "count": count} for name, count in user_counter.most_common(5)]
         
+        # 聊天记录按时间正序排列以便LLM理解
+        valid_msgs.sort(key=lambda x: x['time'])
+        
         chat_log = "\n".join([
-            f"[{datetime.datetime.fromtimestamp(m['time']).strftime('%Y.%m.%d %H:%M')}] {m['name']}: {m['content']}"
+            f"[{datetime.datetime.fromtimestamp(m['time']).strftime('%H:%M')}] {m['name']}: {m['content']}"
             for m in valid_msgs
         ])
         
         return valid_msgs, top_users, dict(trend_counter), chat_log
 
-    async def generate_report(self, bot, group_id: str, hours: int = 24, silent: bool = False):
+    async def generate_report(self, bot, group_id: str, silent: bool = False):
         """
-        核心生成逻辑：获取消息 -> 分析 -> 渲染图片
-        返回: 图片的 URL/Path/Base64 (取决于 render 结果) 或 None
+        核心生成逻辑
         """
+        # 1. 确定时间范围：今天0点到现在
+        today_start_ts = self.get_today_start_timestamp()
+        
         try:
             group_info = await bot.api.call_action("get_group_info", group_id=group_id)
         except:
             group_info = {"group_name": "未知群聊"}
 
-        # 1. 获取消息
-        raw_messages = await self.fetch_group_history(bot, group_id, hours_limit=hours)
+        # 2. 获取消息
+        raw_messages = await self.fetch_group_history(bot, group_id, start_timestamp=today_start_ts)
         if not raw_messages:
             if not silent: logger.warning(f"群 {group_id} 无法获取历史消息")
             return None
 
-        # 2. 处理数据 (含黑名单过滤)
-        valid_msgs, top_users, trend, chat_log = self.process_messages(raw_messages, hours_limit=hours)
+        # 3. 处理数据
+        valid_msgs, top_users, trend, chat_log = self.process_messages(raw_messages, start_timestamp=today_start_ts)
         if not valid_msgs:
-            if not silent: logger.warning(f"群 {group_id} 无有效聊天记录")
+            if not silent: logger.warning(f"群 {group_id} 今天无有效聊天记录")
             return None
 
         if len(chat_log) > self.msg_token_limit:
             chat_log = chat_log[:self.msg_token_limit]
 
-        # 3. LLM 请求
+        # 4. LLM 请求
         prompt = f"""
-        你是一个群聊记录员“{self.bot_name}”。请根据以下的群聊记录（最近{hours}小时），生成一份总结数据。
+        你是一个群聊记录员“{self.bot_name}”。请根据以下的群聊记录（日期：{datetime.datetime.now().strftime('%Y-%m-%d')}），生成一份总结数据。
         
         【要求】：
-        1. 分析 3-8 个主要话题，每个话题包含：时间段（如2026-01-15 10:00 ~ 2026-01-15 11:00）和简短内容。
-        2. 写一段“{self.bot_name}的悄悄话”作为总结，风格温暖、感性。
+        1. 分析 3-8 个主要话题，每个话题包含：时间段（如 10:00 ~ 11:00）和简短内容。
+        2. 写一段“{self.bot_name}的悄悄话”作为总结，风格温暖、感性，对今天群里的氛围进行点评。
         3. 严格返回 JSON 格式：{{"topics": [{{"time_range": "...", "summary": "..."}}],"closing_remark": "..."}}
         
         【聊天记录】：
@@ -259,7 +282,7 @@ class GroupSummaryPlugin(Star):
             logger.error(f"LLM Error: {e}")
             analysis_data = {"topics": [], "closing_remark": "总结生成失败，请检查后台日志。"}
 
-        # 4. 渲染
+        # 5. 渲染
         try:
             render_data = {
                 "date": datetime.datetime.now().strftime("%Y.%m.%d"),
@@ -281,29 +304,27 @@ class GroupSummaryPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def summarize_group(self, event: AstrMessageEvent):
-        """手动指令：/总结群聊"""
-        hours = 24
+        """手动指令：/总结群聊 (默认总结今天)"""
         group_id = event.get_group_id()
         
-        # 1. 发送提示 (仅手动模式)
-        yield event.plain_result(f"🌱 正在连接神经云端，回溯最近 {hours} 小时的记忆...")
+        yield event.plain_result(f"🌱 正在回溯今日记忆...")
         
-        # 2. 调用核心逻辑
-        img_result = await self.generate_report(event.bot, group_id, hours, silent=False)
+        # 手动调用，silent=False
+        img_result = await self.generate_report(event.bot, group_id, silent=False)
         
         if img_result:
             yield event.image_result(img_result)
         else:
-            yield event.plain_result("❌ 总结生成失败，可能是没有聊天记录或配置错误。")
+            yield event.plain_result("❌ 总结生成失败，可能是今天没有聊天记录或配置错误。")
 
     # --- Tool 入口 ---
     @filter.llm_tool(name="group_summary_tool")
-    async def call_summary_tool(self, event: AstrMessageEvent, hours: int = 24):
-        """LLM调用工具"""
+    async def call_summary_tool(self, event: AstrMessageEvent):
+        """LLM调用工具：总结今天群聊"""
         group_id = event.get_group_id()
-        yield event.plain_result(f"🌱 正在分析最近 {hours} 小时的群聊内容...")
+        yield event.plain_result(f"🌱 正在分析今日群聊内容...")
         
-        img_result = await self.generate_report(event.bot, group_id, hours, silent=False)
+        img_result = await self.generate_report(event.bot, group_id, silent=False)
         
         if img_result:
             yield event.image_result(img_result)
