@@ -5,6 +5,7 @@ import time
 import datetime
 import traceback
 import asyncio
+import base64  # 新增 base64 库
 from collections import Counter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -30,7 +31,7 @@ def _parse_llm_json(text: str) -> dict:
     raise ValueError("无法从 LLM 回复中提取有效的 JSON 数据")
 
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "1.2.1")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "1.2.2")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -98,32 +99,31 @@ class GroupSummaryPlugin(Star):
             # 调用核心生成逻辑 (silent=True)
             img_path = await self.generate_report(bot, g_id_str, silent=True)
             
-            if img_path:
+            if img_path and os.path.exists(img_path):
                 try:
-                    # 关键修复：OneBot v11 发送本地图片通常需要 file:// 前缀
-                    # AstrBot 的 html_render 返回的是绝对路径
-                    if not img_path.startswith("file://") and not img_path.startswith("http"):
-                         final_file_path = f"file://{img_path}"
-                    else:
-                         final_file_path = img_path
-
+                    # 关键修复：读取图片并转换为 Base64
+                    # 这样可以解决 Docker 容器路径不互通的问题
+                    with open(img_path, "rb") as image_file:
+                        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                    
                     payload = {
                         "group_id": int(g_id_str),
                         "message": [
                             {
                                 "type": "image",
                                 "data": {
-                                    "file": final_file_path
+                                    "file": f"base64://{encoded_string}"
                                 }
                             }
                         ]
                     }
-                    await bot.api.call_action("send_group_msg", **payload)
-                    logger.info(f"群聊总结(增强版): 群 {g_id_str} 推送成功。")
+                    ret = await bot.api.call_action("send_group_msg", **payload)
+                    logger.info(f"群聊总结(增强版): 群 {g_id_str} 推送结果: {ret}")
                 except Exception as e:
-                    logger.error(f"群聊总结(增强版): 群 {g_id_str} 推送失败: {e}")
+                    logger.error(f"群聊总结(增强版): 群 {g_id_str} 推送失败 (Error): {e}")
+                    logger.error(traceback.format_exc())
             else:
-                logger.info(f"群聊总结(增强版): 群 {g_id_str} 无内容生成，跳过推送。")
+                logger.info(f"群聊总结(增强版): 群 {g_id_str} 生成失败或图片路径不存在，跳过推送。")
             
             # 避免触发风控
             await asyncio.sleep(5)
