@@ -30,7 +30,7 @@ def _parse_llm_json(text: str) -> dict:
     raise ValueError("无法从 LLM 回复中提取有效的 JSON 数据")
 
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "1.2.5")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "1.2.6")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -78,7 +78,7 @@ class GroupSummaryPlugin(Star):
         except Exception as e:
             logger.error(f"群聊总结(增强版): 定时任务启动失败，请检查时间格式(HH:MM): {e}")
 
-    # --- 关键修复：自动捕获 Bot 实例 ---
+    # --- 自动捕获 Bot 实例 ---
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def capture_bot_instance(self, event: AstrMessageEvent):
         """监听任意群消息以捕获 Bot 实例供定时任务使用"""
@@ -110,35 +110,44 @@ class GroupSummaryPlugin(Star):
                 
                 # 调用核心生成逻辑 (silent=True)
                 img_path = await self.generate_report(bot, g_id_str, silent=True)
-                logger.info(f"群聊总结(增强版): [Step 4] 图片生成路径: {img_path}")
+                logger.info(f"群聊总结(增强版): [Step 4] 图片生成结果: {img_path}")
                 
                 if img_path:
-                    # --- 路径清理逻辑 ---
-                    local_path = img_path
-                    if local_path.startswith("file://"):
-                        local_path = local_path[7:]
-                    if os.name == 'nt' and local_path.startswith('/') and ':' in local_path:
-                        local_path = local_path[1:]
+                    try:
+                        cq_code = ""
+                        # --- 分支 A: 如果是网络链接 (http/https) ---
+                        if img_path.startswith("http"):
+                            logger.info(f"群聊总结(增强版): [Step 5-A] 检测到远程 URL，直接使用 URL 构建 CQ 码")
+                            cq_code = f"[CQ:image,file={img_path}]"
+                            
+                        # --- 分支 B: 如果是本地文件 ---
+                        else:
+                            # 路径清理
+                            local_path = img_path
+                            if local_path.startswith("file://"):
+                                local_path = local_path[7:]
+                            if os.name == 'nt' and local_path.startswith('/') and ':' in local_path:
+                                local_path = local_path[1:]
 
-                    if os.path.exists(local_path):
-                        try:
-                            logger.info(f"群聊总结(增强版): [Step 5] 正在读取文件并转码: {local_path}")
-                            with open(local_path, "rb") as image_file:
-                                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                            
-                            # 使用 CQ 码发送，兼容性更好
-                            cq_code = f"[CQ:image,file=base64://{encoded_string}]"
-                            
+                            if os.path.exists(local_path):
+                                logger.info(f"群聊总结(增强版): [Step 5-B] 正在读取本地文件并转码: {local_path}")
+                                with open(local_path, "rb") as image_file:
+                                    encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                                cq_code = f"[CQ:image,file=base64://{encoded_string}]"
+                            else:
+                                logger.error(f"群聊总结(增强版): [Error] 找不到本地图片文件，且不是远程 URL: {local_path}")
+                                continue # 跳过当前群
+
+                        # --- 发送逻辑 ---
+                        if cq_code:
                             logger.info(f"群聊总结(增强版): [Step 6] 正在调用 send_group_msg API...")
                             # 强制转 int 确保 API 兼容
                             ret = await bot.api.call_action("send_group_msg", group_id=int(g_id_str), message=cq_code)
                             logger.info(f"群聊总结(增强版): [Success] 群 {g_id_str} 推送响应: {ret}")
                             
-                        except Exception as e:
-                            logger.error(f"群聊总结(增强版): [Error] 群 {g_id_str} 推送过程发生异常: {e}")
-                            logger.error(traceback.format_exc())
-                    else:
-                        logger.error(f"群聊总结(增强版): [Error] 找不到生成的图片文件: {local_path}")
+                    except Exception as e:
+                        logger.error(f"群聊总结(增强版): [Error] 群 {g_id_str} 推送过程发生异常: {e}")
+                        logger.error(traceback.format_exc())
                 else:
                     logger.info(f"群聊总结(增强版): [Skip] 群 {g_id_str} 生成返回为空(可能无消息)，跳过。")
                 
