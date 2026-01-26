@@ -17,7 +17,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
 
-# 常量定义 (消除魔法数字)
+# 常量定义
 VERSION = "0.1.30"
 MAX_RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY = 1  # 秒
@@ -30,13 +30,15 @@ def _parse_llm_json(text: str) -> dict:
     # 清洗 Markdown 代码块
     if "```" in text:
         text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE | re.DOTALL).strip()
+    
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+    
     try:
-        # 贪婪匹配最外层的 {}
-        match = re.search(r"\{[\s\S]*\}", text)
+        # 非贪婪匹配最外层的 {}
+        match = re.search(r"\{[\s\S]*?\}", text)
         if match:
             json_str = match.group()
             return json.loads(json_str)
@@ -65,13 +67,13 @@ class GroupSummaryPlugin(Star):
         # 状态管理
         self._global_bot = None
         self._bot_lock = asyncio.Lock()
+        self.scheduler = None # 初始化占位，在 setup_schedule 中实例化
 
-        # 模板加载 (使用 pathlib)
+        # 模板加载
         self.template_path = Path(__file__).parent / "templates" / "report.html"
         self.html_template = self._load_template()
 
-        # 定时任务初始化
-        self.scheduler = AsyncIOScheduler()
+        # 启动定时任务
         if self.enable_auto_push:
             self.setup_schedule()
 
@@ -80,9 +82,6 @@ class GroupSummaryPlugin(Star):
         try:
             if not self.template_path.exists():
                 raise FileNotFoundError(f"模板文件不存在: {self.template_path}")
-            
-            # 解决同步阻塞 IO 问题：虽然这里是初始化读取，但最佳实践应尽量避免
-            # 考虑到只在启动时运行一次，此处保留同步读取，或者可改为 aiofiles
             return self.template_path.read_text(encoding="utf-8")
         except Exception as e:
             logger.error(f"群聊总结({VERSION}): 模板加载失败: {e}")
@@ -91,10 +90,10 @@ class GroupSummaryPlugin(Star):
     def setup_schedule(self):
         """配置定时任务"""
         try:
-            if self.scheduler.running:
+            # 统一管理生命周期，避免重复初始化
+            if self.scheduler and self.scheduler.running:
                 self.scheduler.shutdown()
             
-            # 重新实例化调度器
             self.scheduler = AsyncIOScheduler()
             
             try:
@@ -111,17 +110,32 @@ class GroupSummaryPlugin(Star):
     def terminate(self):
         """插件卸载/重载时的资源清理"""
         try:
-            if self.scheduler.running:
-                self.scheduler.shutdown(wait=False) # 不等待任务结束，强制关闭
+            if self.scheduler and self.scheduler.running:
+                self.scheduler.shutdown(wait=False)
                 logger.info(f"群聊总结({VERSION}): 定时任务已停止")
         except Exception as e:
             logger.error(f"群聊总结({VERSION}): 资源清理失败: {e}")
 
     async def _get_bot(self, event: Optional[AstrMessageEvent] = None):
-        """统一获取 Bot 实例，线程安全"""
+        """
+        统一获取 Bot 实例，优先尝试从 Context 获取活动 Bot，
+        失败则回退到被动捕获的缓存。
+        """
+        # 1. 尝试从 Context 主动获取 (解决竞态条件)
+        try:
+            if hasattr(self.context, "get_bots"):
+                bots = self.context.get_bots()
+                if bots:
+                    # 获取第一个可用的 Bot 实例
+                    return list(bots.values())[0]
+        except Exception:
+            pass # 忽略版本兼容性问题
+
+        # 2. 如果缓存存在，直接返回
         if self._global_bot:
             return self._global_bot
         
+        # 3. 如果有事件，从事件中捕获并缓存
         if event:
             async with self._bot_lock:
                 if not self._global_bot:
@@ -141,7 +155,6 @@ class GroupSummaryPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def summarize_group(self, event: AstrMessageEvent, *args, **kwargs):
         """手动指令：/总结群聊"""
-        # 强制更新 Bot 实例
         await self._get_bot(event)
             
         group_id = event.get_group_id()
@@ -178,16 +191,18 @@ class GroupSummaryPlugin(Star):
     # ================= 核心功能模块 =================
 
     async def _fetch_messages(self, bot, group_id: str, start_timestamp: float) -> List[dict]:
-        """获取群聊历史消息"""
+        """获取群聊历史消息 (防死循环优化)"""
         all_messages = []
         message_seq = 0
         cutoff_time = start_timestamp
+        last_fetched_seq = None # 用于检测 API 是否死循环
 
         for round_idx in range(self.max_query_rounds):
             if len(all_messages) >= self.max_msg_count:
                 break
 
             try:
+                # 注意：OneBot V11 特定实现，非 OneBot 协议可能会报错
                 params = {
                     "group_id": group_id,
                     "count": 200,
@@ -200,33 +215,31 @@ class GroupSummaryPlugin(Star):
                 if not round_messages:
                     break
                 
-                # 修复逻辑：reverseOrder=True 通常返回 [..., old, older, oldest]
-                # 或者 [newest, ..., oldest] 取决于实现。
-                # 假设通常是按时间倒序或顺序返回。关键是找到这一批里最旧的消息SEQ。
+                # 排序校验：确保按时间倒序处理
+                # 无论 API 返回顺序如何，我们按时间戳排序找出最旧的一条
+                batch_msgs = sorted(round_messages, key=lambda x: x.get('time', 0), reverse=True)
                 
-                # 安全获取时间戳
-                batch_msgs = round_messages
-                # 假设列表是有序的，我们需要找到这批消息里 seq 最小（最旧）的那个
-                # 在 OneBot 11 中，message_seq 通常随时间递增。
+                oldest_msg = batch_msgs[-1]
+                oldest_seq = oldest_msg.get('message_seq')
+                oldest_time = oldest_msg.get('time', 0)
+
+                # 死循环检测：如果这一次的最旧 seq 和上一次一样，说明没有更多消息了
+                if last_fetched_seq is not None and oldest_seq == last_fetched_seq:
+                    break
+                last_fetched_seq = oldest_seq
                 
-                current_min_seq = batch_msgs[0]['message_seq']
-                current_min_time = batch_msgs[0]['time']
-                
-                for msg in batch_msgs:
-                    if msg['message_seq'] < current_min_seq:
-                        current_min_seq = msg['message_seq']
-                    if msg['time'] < current_min_time:
-                        current_min_time = msg['time']
-                
-                message_seq = current_min_seq # 更新为下一轮查询的起点
-                
+                message_seq = oldest_seq # 更新下一次查询的游标
                 all_messages.extend(batch_msgs)
 
-                if current_min_time < cutoff_time:
+                if oldest_time < cutoff_time:
                     break
                     
             except Exception as e:
-                logger.error(f"群聊总结({VERSION}): 获取消息异常: {e}")
+                # 兼容处理：如果不支持 get_group_msg_history，记录日志并退出
+                if "ActionFailed" in str(e) or "404" in str(e):
+                    logger.error(f"群聊总结({VERSION}): API 调用失败，可能是协议不支持: {e}")
+                else:
+                    logger.error(f"群聊总结({VERSION}): 获取消息异常: {e}")
                 break
 
         return all_messages
@@ -245,9 +258,8 @@ class GroupSummaryPlugin(Star):
 
             raw_msg = msg.get("raw_message", "")
             
-            # 过滤逻辑：跳过包含 CQ 码的图片或记录，避免 token 浪费
-            # 修复冗余代码，实际执行 continue
-            if "[CQ:image" in raw_msg or "[CQ:record" in raw_msg: 
+            # 过滤多媒体消息 CQ 码
+            if "[CQ:image" in raw_msg or "[CQ:record" in raw_msg or "[CQ:video" in raw_msg: 
                 continue
             
             sender = msg.get("sender", {})
@@ -273,12 +285,10 @@ class GroupSummaryPlugin(Star):
         top_users = [{"name": name, "count": count} for name, count in user_counter.most_common(5)]
         valid_msgs.sort(key=lambda x: x['time'])
         
-        # 修复：防止截断导致敏感信息泄露或 JSON 错误
-        # 不再使用字符串切片，而是按条数截断
-        # 估算每条消息平均 30 token，简单控制条数
-        max_items = int(self.msg_token_limit / 20) # 粗略估算
+        # 智能截断：按条数而非字符数截断，避免截断 JSON 转义符
+        max_items = int(self.msg_token_limit / 20) 
         if len(valid_msgs) > max_items:
-             valid_msgs_for_llm = valid_msgs[-max_items:] # 取最新的 N 条
+             valid_msgs_for_llm = valid_msgs[-max_items:]
         else:
              valid_msgs_for_llm = valid_msgs
 
@@ -375,7 +385,6 @@ class GroupSummaryPlugin(Star):
             }
             options = {"quality": 95, "device_scale_factor_level": "ultra", "viewport_width": 500}
             
-            # 使用 self.html_template (内存中的字符串)
             return await self.html_render(self.html_template, render_data, options=options)
 
         except Exception as e:
@@ -402,39 +411,37 @@ class GroupSummaryPlugin(Star):
                 g_id_str = str(group_id)
                 logger.info(f"群聊总结({VERSION}): 正在处理群 {g_id_str}")
                 
-                # 独立的 try-except 块，防止一个群失败影响其他群
                 try:
                     img_path = await self.generate_report(bot, g_id_str, silent=True)
                     
                     if img_path:
                         cq_code = ""
+                        # 兼容处理 URL 和 本地路径
                         if img_path.startswith("http"):
                             cq_code = f"[CQ:image,file={img_path}]"
                         else:
-                            # 安全地处理本地文件
-                            local_path = Path(img_path)
-                            # 简单的路径清理，防止 file:// 前缀干扰
-                            if str(local_path).startswith("file:"):
-                                # 这里需要更严谨的解析，但在 AstrBot 环境下通常是绝对路径
-                                # 简化处理：假设 html_render 返回的是可信路径
-                                pass 
+                            # 修复路径处理：移除 file:// 前缀
+                            clean_path = img_path
+                            if clean_path.startswith("file://"):
+                                clean_path = clean_path[7:]
+                            elif clean_path.startswith("file:"):
+                                clean_path = clean_path[5:]
+                            
+                            # Windows 路径修复 /C:/Users... -> C:/Users...
+                            if os.name == 'nt' and clean_path.startswith('/') and ':' in clean_path:
+                                clean_path = clean_path[1:]
 
-                            # 检查文件是否存在且大小合适
-                            if os.path.exists(img_path):
-                                f_size = os.path.getsize(img_path)
+                            if os.path.exists(clean_path):
+                                f_size = os.path.getsize(clean_path)
                                 if f_size > MAX_IMAGE_SIZE:
                                     logger.error(f"图片过大 ({f_size} bytes)，跳过发送")
                                     continue
                                     
-                                with open(img_path, "rb") as image_file:
+                                with open(clean_path, "rb") as image_file:
                                     encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
                                 cq_code = f"[CQ:image,file=base64://{encoded_string}]"
                             else:
-                                # 尝试处理 URL 格式的本地路径
-                                if "://" not in img_path and os.path.exists(img_path):
-                                     with open(img_path, "rb") as image_file:
-                                        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                                     cq_code = f"[CQ:image,file=base64://{encoded_string}]"
+                                logger.error(f"群聊总结({VERSION}): 图片文件不存在: {clean_path}")
 
                         if cq_code:
                             await bot.api.call_action("send_group_msg", group_id=int(g_id_str), message=cq_code)
@@ -445,7 +452,6 @@ class GroupSummaryPlugin(Star):
                 except Exception as e:
                     logger.error(f"群聊总结({VERSION}): 群 {g_id_str} 推送异常: {e}")
                 
-                # 避免触发风控
                 await asyncio.sleep(PUSH_DELAY_BETWEEN_GROUPS)
                 
         except Exception as e:
