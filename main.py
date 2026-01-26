@@ -17,8 +17,7 @@ from astrbot.api import logger
 def _parse_llm_json(text: str) -> dict:
     """增强型 JSON 解析器"""
     text = text.strip()
-    # 清洗 Markdown 代码块
-    if "```" in text:
+    if text.startswith("```"):
         text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE | re.DOTALL).strip()
     try:
         return json.loads(text)
@@ -33,7 +32,7 @@ def _parse_llm_json(text: str) -> dict:
         pass
     raise ValueError(f"无法提取有效 JSON，原始文本: {text[:50]}...")
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.29")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.27")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -60,17 +59,18 @@ class GroupSummaryPlugin(Star):
         try:
             with open(template_path, "r", encoding="utf-8") as f:
                 self.html_template = f.read()
-            logger.info(f"群聊总结(增强版): 模板加载成功 | v0.1.29 Stable")
+            logger.info(f"群聊总结(增强版): 模板加载成功 | v0.1.27 HotFix")
         except FileNotFoundError:
             logger.error(f"群聊总结(增强版): 模板文件丢失: {template_path}")
             self.html_template = "<h1>Template Not Found</h1>"
 
-        # 定时任务
+        # 定时任务初始化
         self.scheduler = AsyncIOScheduler()
         if self.enable_auto_push:
             self.setup_schedule()
 
     def setup_schedule(self):
+        """配置定时任务"""
         try:
             if self.scheduler.running:
                 self.scheduler.shutdown()
@@ -85,67 +85,57 @@ class GroupSummaryPlugin(Star):
             logger.error(f"群聊总结(增强版): 定时任务启动失败: {e}")
 
     def terminate(self):
-        """插件卸载/重载时的资源清理"""
+        """AstrBot 插件卸载/重载时的钩子 (支持热重启)"""
         try:
             if self.scheduler.running:
                 self.scheduler.shutdown()
-                logger.info("群聊总结(增强版): 定时任务已停止 (插件重载)")
+                logger.info("群聊总结(增强版): 定时任务已停止 (资源清理)")
         except Exception as e:
             logger.error(f"群聊总结(增强版): 资源清理失败: {e}")
 
-    # ================= 指令与事件监听 =================
+    # ================= 监听与捕获 (参数兼容性修复) =================
+    # 使用 *args, **kwargs 完美兼容 AstrBot 的调用，并不干扰指令解析器
 
-    # 1. 自动捕获 Bot (保留 *args 以防万一)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def capture_bot_instance(self, event: AstrMessageEvent, *args, **kwargs):
+        """被动监听：捕获 Bot 实例"""
         if self.global_bot is None:
             self.global_bot = event.bot
 
-    # 2. 手动指令 (关键修复：移除了重复的 event_message_type 装饰器)
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
-    async def summarize_group(self, event: AstrMessageEvent):
-        """手动指令：/总结群聊"""
-        # 手动触发时强制刷新 Bot
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def summarize_group(self, event: AstrMessageEvent, *args, **kwargs):
+        """手动指令：捕获 Bot 并执行"""
         if self.global_bot is None:
             self.global_bot = event.bot
             
         group_id = event.get_group_id()
-        if not group_id:
-            yield event.plain_result("⚠️ 请在群聊中使用此指令。")
-            return
-
         yield event.plain_result(f"🌱 正在连接神经云端，回溯今日记忆...")
-        
-        # silent=False 会在出错时返回具体原因
         img_result = await self.generate_report(event.bot, group_id, silent=False)
-        
         if img_result:
             yield event.image_result(img_result)
         else:
-            yield event.plain_result("❌ 总结生成失败，可能是记录为空或 LLM 响应异常。")
+            yield event.plain_result("❌ 总结生成失败，可能是记录为空或 LLM 多次重试失败。")
 
-    # 3. LLM 工具调用
     @filter.llm_tool(name="group_summary_tool")
     async def call_summary_tool(self, event: AstrMessageEvent, *args, **kwargs):
+        """LLM调用：捕获 Bot 并执行"""
         if self.global_bot is None:
             self.global_bot = event.bot
             
         group_id = event.get_group_id()
-        if not group_id:
-            yield event.plain_result("无法在私聊中生成群总结。")
-            return
-
         yield event.plain_result(f"🌱 正在分析今日群聊内容...")
         img_result = await self.generate_report(event.bot, group_id, silent=False)
         if img_result:
             yield event.image_result(img_result)
         else:
             yield event.plain_result("无法生成总结。")
-
-    # ================= 定时推送逻辑 =================
+            
+    # ================= 核心逻辑 =================
 
     async def run_scheduled_task(self):
+        """定时任务逻辑"""
         try:
             logger.info("群聊总结(增强版): [Step 1] 开始定时推送...")
             
@@ -155,7 +145,7 @@ class GroupSummaryPlugin(Star):
 
             bot = self.global_bot
             if not self.push_groups:
-                logger.warning("群聊总结(增强版): 推送列表为空，请检查配置。")
+                logger.warning("群聊总结(增强版): 推送列表为空，请检查配置 push_groups。")
                 return
 
             for group_id in self.push_groups:
@@ -178,10 +168,10 @@ class GroupSummaryPlugin(Star):
 
                             if os.path.exists(local_path):
                                 with open(local_path, "rb") as image_file:
-                                    b64 = base64.b64encode(image_file.read()).decode('utf-8')
-                                cq_code = f"[CQ:image,file=base64://{b64}]"
+                                    encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                                cq_code = f"[CQ:image,file=base64://{encoded_string}]"
                             else:
-                                logger.error(f"群聊总结(增强版): 图片缺失: {local_path}")
+                                logger.error(f"群聊总结(增强版): 图片文件不存在: {local_path}")
                                 continue
 
                         if cq_code:
@@ -191,15 +181,13 @@ class GroupSummaryPlugin(Star):
                     except Exception as e:
                         logger.error(f"群聊总结(增强版): 群 {g_id_str} 推送异常: {e}")
                 else:
-                    logger.info(f"群聊总结(增强版): 群 {g_id_str} 无生成结果")
+                    logger.info(f"群聊总结(增强版): 群 {g_id_str} 无生成结果(可能无消息)")
                 
                 await asyncio.sleep(5)
                 
         except Exception as e:
-            logger.error(f"群聊总结(增强版): 定时任务错误: {e}")
+            logger.error(f"群聊总结(增强版): 定时任务严重错误: {e}")
             logger.error(traceback.format_exc())
-
-    # ================= 数据获取与处理 =================
 
     def get_today_start_timestamp(self):
         now = datetime.datetime.now()
@@ -329,7 +317,7 @@ class GroupSummaryPlugin(Star):
         {chat_log}
         """
 
-        # LLM 自动重试逻辑 (3次)
+        # ================= LLM 重试机制 (3次) =================
         analysis_data = None
         provider = self.context.get_provider_by_id(self.config.get("provider_id")) or self.context.get_using_provider()
         
@@ -340,7 +328,7 @@ class GroupSummaryPlugin(Star):
         for attempt in range(3):
             try:
                 if attempt > 0:
-                    await asyncio.sleep(1) # 避让
+                    await asyncio.sleep(1) # 稍作等待
 
                 response = await provider.text_chat(prompt, session_id=None)
                 if not response or not response.completion_text:
@@ -350,10 +338,11 @@ class GroupSummaryPlugin(Star):
                 if analysis_data:
                     break 
             except Exception as e:
-                logger.error(f"群聊总结: LLM Error (Attempt {attempt+1}): {e}")
+                logger.error(f"LLM Error (Attempt {attempt+1}): {e}")
         
         if not analysis_data:
-            analysis_data = {"topics": [], "closing_remark": "总结生成失败 (LLM 异常)。"}
+            analysis_data = {"topics": [], "closing_remark": "总结生成失败 (LLM 返回数据格式错误或超时)。"}
+        # ====================================================
 
         try:
             render_data = {
