@@ -1,12 +1,11 @@
 import json
 import os
 import re
-import time
 import datetime
 import traceback
 import asyncio
 import base64
-import textwrap
+import urllib.parse
 from pathlib import Path
 from collections import Counter
 from typing import List, Dict, Tuple, Optional, Any, Set
@@ -19,72 +18,60 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 # --- 全局常量配置 ---
-VERSION = "0.1.31"
+VERSION = "0.1.32"
 MAX_RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY = 2.0
 PUSH_DELAY_BETWEEN_GROUPS = 5.0
-# Base64 膨胀系数约 1.33，预留缓冲区。OneBot V11 普遍限制在 30MB 左右，保险起见设为 10MB
-MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024 
-# 估算 1 Token ≈ 2 字符 (中文环境)
+MAX_IMAGE_SIZE_BYTES = 10_485_760  # 10MB
 ESTIMATED_CHARS_PER_TOKEN = 2
-LLM_TIMEOUT = 60 # LLM 请求超时时间 (秒)
+LLM_TIMEOUT = 60
+BASE64_CHUNK_SIZE = 8192 # 分块读取大小
+
+# 平台常量
+PLATFORM_ONEBOT = ("qq", "onebot", "aiocqhttp", "napcat", "llonebot")
+PLATFORM_UNSUPPORTED = ("telegram", "discord", "wechat")
 
 def _parse_llm_json(text: str) -> dict:
-    """
-    鲁棒性 JSON 解析器：寻找最外层的 {} 对，忽略 Markdown 和杂音
-    """
+    """鲁棒性 JSON 解析器"""
     text = text.strip()
-    
-    # 1. 简单清洗 Markdown 代码块标记
+    # 简单清洗 Markdown
     text = re.sub(r"^```(json)?", "", text, flags=re.MULTILINE).strip()
     text = re.sub(r"```$", "", text, flags=re.MULTILINE).strip()
 
-    # 2. 尝试直接解析
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # 3. 栈式寻找最外层大括号 (比正则更可靠)
+    # 栈式寻找最外层大括号
     try:
         stack = 0
-        start_index = -1
-        end_index = -1
-        
+        start = -1
         for i, char in enumerate(text):
             if char == '{':
-                if stack == 0:
-                    start_index = i
+                if stack == 0: start = i
                 stack += 1
             elif char == '}':
                 stack -= 1
                 if stack == 0:
-                    end_index = i + 1
-                    # 找到第一个完整的 JSON 对象后停止 (通常是我们需要的)
-                    break
-        
-        if start_index != -1 and end_index != -1:
-            json_str = text[start_index:end_index]
-            return json.loads(json_str)
+                    return json.loads(text[start:i+1])
     except Exception:
         pass
 
     raise ValueError(f"无法提取有效 JSON，文本前50字: {text[:50]}...")
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.31")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.32")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
         
-        # 基础配置
+        # 配置加载
         self.max_msg_count = self.config.get("max_msg_count", 2000)
         self.max_query_rounds = self.config.get("max_query_rounds", 10)
         self.bot_name = self.config.get("bot_name", "BOT")
         self.msg_token_limit = self.config.get("token_limit", 6000)
-        
-        # 新增配置
-        self.exclude_users = self.config.get("exclude_users", []) # List[str]
+        self.exclude_users = self.config.get("exclude_users", [])
         self.enable_auto_push = self.config.get("enable_auto_push", False)
         self.push_time = self.config.get("push_time", "23:00")
         self.push_groups = self.config.get("push_groups", [])
@@ -93,7 +80,6 @@ class GroupSummaryPlugin(Star):
         # 状态管理
         self._global_bot = None
         self._bot_lock = asyncio.Lock()
-        # 针对每个群的生成锁，防止手动和自动撞车
         self._group_locks: Dict[str, asyncio.Lock] = {}
         self.scheduler = None 
 
@@ -101,7 +87,6 @@ class GroupSummaryPlugin(Star):
         self.template_path = Path(__file__).parent / "templates" / "report.html"
         self.html_template = self._load_template()
 
-        # 启动定时任务
         if self.enable_auto_push:
             self.setup_schedule()
 
@@ -111,7 +96,6 @@ class GroupSummaryPlugin(Star):
         return self._group_locks[group_id]
 
     def _load_template(self) -> str:
-        """加载 HTML 模板"""
         try:
             if not self.template_path.exists():
                 raise FileNotFoundError(f"模板文件不存在: {self.template_path}")
@@ -121,13 +105,12 @@ class GroupSummaryPlugin(Star):
             return "<h1>Template Load Error</h1>"
 
     def setup_schedule(self):
-        """配置定时任务"""
         try:
+            # 优雅关闭旧调度器 (wait=True 防止任务残留)
             if self.scheduler and self.scheduler.running:
-                self.scheduler.shutdown()
+                self.scheduler.shutdown(wait=True)
             
             self.scheduler = AsyncIOScheduler()
-            
             try:
                 hour, minute = self.push_time.split(":")
                 trigger = CronTrigger(hour=int(hour), minute=int(minute))
@@ -140,62 +123,48 @@ class GroupSummaryPlugin(Star):
             logger.error(f"群聊总结({VERSION}): 定时任务启动失败: {e}")
 
     def terminate(self):
-        """插件卸载/重载时的资源清理"""
         try:
             if self.scheduler and self.scheduler.running:
-                self.scheduler.shutdown(wait=False)
+                self.scheduler.shutdown(wait=False) # 卸载时不等待
                 logger.info(f"群聊总结({VERSION}): 定时任务已停止")
         except Exception as e:
             logger.error(f"群聊总结({VERSION}): 资源清理失败: {e}")
 
-    # ================= HTML 渲染兼容层 =================
-    async def html_render(self, template: str, data: dict, options: dict = None) -> Optional[str]:
-        try:
-            if hasattr(self.context, "image_renderer"):
-                return await self.context.image_renderer.render(template, data, **(options or {}))
-            logger.error(f"群聊总结({VERSION}): Context 缺少 image_renderer")
-            return None
-        except Exception as e:
-            logger.error(f"群聊总结({VERSION}): 渲染失败: {e}")
-            return None
-
-    # ================= Bot 获取逻辑 (修复冷启动) =================
+    # ================= 核心修复：Bot获取 (读写锁保护) =================
     async def _get_bot(self, event: Optional[AstrMessageEvent] = None) -> Optional[Any]:
-        # 1. 优先使用当前事件的 Bot
-        if event and event.bot:
-            async with self._bot_lock:
+        async with self._bot_lock:
+            # 1. 优先更新缓存
+            if event and event.bot:
                 self._global_bot = event.bot
-            return event.bot
+                return event.bot
 
-        # 2. 其次使用缓存
-        if self._global_bot:
-            return self._global_bot
-        
-        # 3. 冷启动兜底：主动从 Context 搜索
-        try:
-            if hasattr(self.context, "get_bots"):
-                bots = self.context.get_bots()
-                if bots:
-                    # 优先寻找 OneBot 适配器
-                    for bot_id, bot_inst in bots.items():
-                        platform = getattr(bot_inst, "platform_name", "").lower()
-                        if "qq" in platform or "onebot" in platform:
-                            async with self._bot_lock:
+            # 2. 读取缓存
+            if self._global_bot:
+                return self._global_bot
+            
+            # 3. 冷启动兜底
+            try:
+                if hasattr(self.context, "get_bots"):
+                    bots = self.context.get_bots()
+                    if bots:
+                        for bot_inst in bots.values():
+                            p_name = getattr(bot_inst, "platform_name", "").lower()
+                            if any(k in p_name for k in PLATFORM_ONEBOT):
                                 self._global_bot = bot_inst
-                            return bot_inst
-                    # 没找到 OneBot，随便返回一个
-                    return next(iter(bots.values()))
-        except Exception:
-            pass
-
-        return None
+                                return bot_inst
+                        # 没找到 OneBot，返回第一个
+                        self._global_bot = next(iter(bots.values()))
+                        return self._global_bot
+            except Exception:
+                pass
+            return None
 
     # ================= 事件监听 =================
-
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def capture_bot_instance(self, event: AstrMessageEvent, *args, **kwargs):
-        if self._global_bot is None:
-            await self._get_bot(event)
+        # 双重检查锁优化性能
+        if self._global_bot: return
+        await self._get_bot(event)
 
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -207,15 +176,14 @@ class GroupSummaryPlugin(Star):
             
         group_id = event.get_group_id()
         if not group_id:
-            yield event.plain_result("⚠️ 请在群聊中使用此指令。")
+            yield event.plain_result("⚠️ 请在群聊中使用。")
             return
 
         yield event.plain_result(f"🌱 正在连接神经云端，回溯今日记忆...")
         
-        # 使用锁防止重复触发
         lock = self._get_group_lock(group_id)
         if lock.locked():
-            yield event.plain_result("⚠️ 该群正在生成总结中，请稍候...")
+            yield event.plain_result("⚠️ 该群正在生成中，请稍候...")
             return
 
         async with lock:
@@ -224,7 +192,7 @@ class GroupSummaryPlugin(Star):
         if img_result:
             yield event.image_result(img_result)
         else:
-            yield event.plain_result("❌ 总结生成失败，请检查后台日志。")
+            yield event.plain_result("❌ 总结生成失败，请检查日志。")
 
     @filter.llm_tool(name="group_summary_tool")
     async def call_summary_tool(self, event: AstrMessageEvent, *args, **kwargs):
@@ -234,10 +202,8 @@ class GroupSummaryPlugin(Star):
             yield event.plain_result("无法生成总结。")
             return
 
-        yield event.plain_result(f"🌱 正在分析今日群聊内容...")
-        
-        lock = self._get_group_lock(group_id)
-        async with lock:
+        yield event.plain_result(f"🌱 正在分析群聊内容...")
+        async with self._get_group_lock(group_id):
             img_result = await self.generate_report(bot, group_id, silent=False)
             
         if img_result:
@@ -245,312 +211,236 @@ class GroupSummaryPlugin(Star):
         else:
             yield event.plain_result("无法生成总结。")
 
-    # ================= 核心逻辑 =================
+    # ================= 核心逻辑拆分 (职责单一化) =================
 
-    async def _fetch_messages(self, bot, group_id: str, start_timestamp: float) -> List[dict]:
-        """获取群聊历史消息 (去重 + 协议检查)"""
-        # 协议检查
-        platform = getattr(bot, "platform_name", "").lower()
-        if "telegram" in platform or "discord" in platform or "wechat" in platform:
-            logger.warning(f"群聊总结({VERSION}): 平台 {platform} 可能不支持 get_group_msg_history")
+    async def _fetch_messages(self, bot, group_id: str, start_ts: float) -> List[dict]:
+        """原子方法：获取消息"""
+        p_name = getattr(bot, "platform_name", "").lower()
+        if any(k in p_name for k in PLATFORM_UNSUPPORTED):
+            logger.warning(f"群聊总结({VERSION}): 平台 {p_name} 可能不支持历史消息API")
 
-        all_messages = []
-        message_seq = 0
-        cutoff_time = start_timestamp
-        
-        # 使用 Set 防止消息重复 (key: message_id)
-        seen_msg_ids = set()
+        all_msgs = []
+        msg_seq = 0
+        last_ids = set()
 
         for _ in range(self.max_query_rounds):
-            if len(all_messages) >= self.max_msg_count:
-                break
+            if len(all_msgs) >= self.max_msg_count: break
 
             try:
-                params = {
-                    "group_id": group_id,
-                    "count": 200,
-                    "message_seq": message_seq,
-                    "reverseOrder": True,
-                }
-                resp: dict = await bot.api.call_action("get_group_msg_history", **params)
-                round_messages = resp.get("messages", [])
+                resp = await bot.api.call_action("get_group_msg_history", 
+                    group_id=group_id, count=200, message_seq=msg_seq, reverseOrder=True)
                 
-                if not round_messages:
-                    break
+                if not resp or "messages" not in resp: break
                 
-                # 统一按时间倒序排序 (Newest -> Oldest)
-                batch_msgs = sorted(round_messages, key=lambda x: x.get('time', 0), reverse=True)
-                
-                # 更新游标 (取这批中最旧的一条的 seq)
-                oldest_in_batch = batch_msgs[-1]
-                current_min_seq = oldest_in_batch.get('message_seq')
-                current_min_time = oldest_in_batch.get('time', 0)
-                
-                # 如果游标没有变化，说明到底了，防止死循环
-                if message_seq != 0 and current_min_seq >= message_seq:
-                    break
-                message_seq = current_min_seq
+                batch = sorted(resp["messages"], key=lambda x: x.get('time', 0), reverse=True)
+                if not batch: break
 
-                # 添加消息 (去重)
-                for msg in batch_msgs:
-                    msg_id = msg.get('message_id')
-                    if msg_id and msg_id not in seen_msg_ids:
-                        all_messages.append(msg)
-                        seen_msg_ids.add(msg_id)
-
-                if current_min_time <= cutoff_time:
+                oldest = batch[-1]
+                msg_seq = oldest.get('message_seq')
+                
+                # 去重与边界检查
+                valid_batch = []
+                for m in batch:
+                    mid = m.get('message_id')
+                    if not mid:
+                        logger.warning(f"群聊总结({VERSION}): 发现无 message_id 的消息，已跳过")
+                        continue
+                    if mid not in last_ids:
+                        valid_batch.append(m)
+                        last_ids.add(mid)
+                
+                all_msgs.extend(valid_batch)
+                
+                # 严格小于检查
+                if oldest.get('time', 0) < start_ts:
                     break
                     
             except Exception as e:
-                logger.error(f"群聊总结({VERSION}): 获取消息异常: {e}")
+                logger.error(f"群聊总结({VERSION}): API调用失败: {e}")
                 break
+                
+        return all_msgs
 
-        return all_messages
-
-    def _process_messages(self, messages: List[dict], start_timestamp: float) -> Tuple[List[dict], List[dict], Dict[str, int], str]:
-        """处理消息：过滤、统计、裁剪"""
-        cutoff_time = start_timestamp
+    def _process_data(self, messages: List[dict], start_ts: float) -> Tuple[Any, Any, Any, str]:
+        """原子方法：数据清洗统计"""
         valid_msgs = []
-        user_counter = Counter()
-        trend_counter = Counter()
+        u_count = Counter()
+        t_count = Counter()
         
-        for msg in messages:
-            ts = msg.get("time", 0)
-            if ts < cutoff_time:
+        for m in messages:
+            if m.get('time', 0) < start_ts: continue
+            
+            raw = m.get('raw_message', "")
+            # 正则清洗 CQ 码
+            content = re.sub(r'\[CQ:[^\]]+\]', '', raw).strip()
+            if not content: continue
+            
+            sender = m.get('sender', {})
+            nick = sender.get('card') or sender.get('nickname') or "未知"
+            uid = sender.get('user_id')
+            
+            if nick in self.exclude_users or (uid and str(uid) in self.exclude_users):
                 continue
 
-            raw_msg = msg.get("raw_message", "")
-            
-            # 使用正则去除所有 CQ 码，只保留文本内容
-            content = re.sub(r'\[CQ:[^\]]+\]', '', raw_msg).strip()
-            
-            if not content:
-                continue
-            
-            sender = msg.get("sender", {})
-            nickname = sender.get("card") or sender.get("nickname") or "未知用户"
-            user_id = sender.get("user_id") # 尝试获取 UserID
-            
-            # 黑名单检查 (支持 昵称 和 UserID)
-            if nickname in self.exclude_users:
-                continue
-            if user_id and str(user_id) in self.exclude_users:
-                continue
+            valid_msgs.append({"time": m['time'], "name": nick, "content": content})
+            u_count[nick] += 1
+            t_count[datetime.datetime.fromtimestamp(m['time']).strftime("%H")] += 1
 
-            valid_msgs.append({
-                "time": ts,
-                "name": nickname,
-                "content": content
-            })
-            user_counter[nickname] += 1
-            
-            # 修复时间格式 "0" -> "00"
-            hour_str = datetime.datetime.fromtimestamp(ts).strftime("%H")
-            trend_counter[hour_str] += 1
-
-        top_users = [{"name": name, "count": count} for name, count in user_counter.most_common(5)]
-        valid_msgs.sort(key=lambda x: x['time']) # 按时间正序排列
+        top_users = [{"name": k, "count": v} for k, v in u_count.most_common(5)]
+        valid_msgs.sort(key=lambda x: x['time'])
         
-        # --- 修复：基于字符长度的裁剪逻辑 (而非条数) ---
-        max_chars = self.msg_token_limit * ESTIMATED_CHARS_PER_TOKEN
-        current_chars = 0
-        final_msgs = []
+        # 按条数截断 (估算)
+        max_items = int(self.msg_token_limit / ESTIMATED_CHARS_PER_TOKEN)
+        msgs_for_llm = valid_msgs[-max_items:] if len(valid_msgs) > max_items else valid_msgs
         
-        # 从最新的消息开始保留
-        for msg in reversed(valid_msgs):
-            # 估算单条长度: 名字 + 内容 + 时间戳开销
-            msg_len = len(msg['content']) + len(msg['name']) + 10 
-            if current_chars + msg_len > max_chars:
-                break
-            final_msgs.insert(0, msg)
-            current_chars += msg_len
-
         chat_log = "\n".join([
             f"[{datetime.datetime.fromtimestamp(m['time']).strftime('%H:%M')}] {m['name']}: {m['content']}"
-            for m in final_msgs
+            for m in msgs_for_llm
         ])
         
-        return valid_msgs, top_users, dict(trend_counter), chat_log
+        return valid_msgs, top_users, dict(t_count), chat_log
 
-    def _construct_prompt(self, chat_log: str) -> str:
-        user_style = self.config.get("summary_prompt_style") or \
-                     f"写一段“{self.bot_name}的悄悄话”作为总结，风格温暖、感性，对今天群里的氛围进行点评。"
-        
-        if "{bot_name}" in user_style:
-            user_style = user_style.replace("{bot_name}", self.bot_name)
-
-        # 使用 textwrap 优化缩进，使用 XML 标签隔离数据防止注入
-        return textwrap.dedent(f"""
-            你是一个群聊记录员“{self.bot_name}”。请根据以下的群聊记录（日期：{datetime.datetime.now().strftime('%Y-%m-%d')}），生成一份总结数据。
-            
-            【要求】：
-            1. 分析 3-8 个主要话题，每个话题包含：时间段（如 10:00 ~ 11:00）和简短内容。
-            2. {user_style}
-            3. 严格返回 JSON 格式：{{"topics": [{{"time_range": "...", "summary": "..."}}],"closing_remark": "..."}}
-            
-            【聊天记录开始】：
-            <chat_logs>
-            {chat_log}
-            </chat_logs>
-            【聊天记录结束】
-        """).strip()
-
-    async def _call_llm(self, prompt: str) -> Optional[dict]:
+    async def _run_llm_analysis(self, chat_log: str) -> Optional[dict]:
+        """原子方法：LLM 分析"""
         provider = self.context.get_provider_by_id(self.config.get("provider_id")) or self.context.get_using_provider()
-        if not provider:
-            logger.error(f"群聊总结({VERSION}): 未配置 LLM Provider")
-            return None
+        if not provider: return None
 
-        for attempt in range(MAX_RETRY_ATTEMPTS):
+        style = self.config.get("summary_prompt_style", "")
+        if "{bot_name}" in style: style = style.replace("{bot_name}", self.bot_name)
+        if not style: style = f"写一段{self.bot_name}的风格点评。"
+
+        prompt = f"""
+        角色：{self.bot_name}。任务：群聊总结。
+        要求：
+        1. 提取3-8个话题(时间段+摘要)。
+        2. {style}
+        3. 返回JSON：{{"topics": [{{"time_range":"", "summary":""}}], "closing_remark":""}}
+        
+        记录：
+        {chat_log}
+        """
+
+        for i in range(MAX_RETRY_ATTEMPTS):
             try:
-                if attempt > 0:
-                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    await asyncio.sleep(delay)
-                    logger.warning(f"群聊总结({VERSION}): LLM 重试 {attempt+1}/{MAX_RETRY_ATTEMPTS}")
-
-                # 增加超时控制
-                response = await asyncio.wait_for(
-                    provider.text_chat(prompt, session_id=None),
+                if i > 0: await asyncio.sleep(RETRY_BASE_DELAY * (2 ** i))
+                
+                resp = await asyncio.wait_for(
+                    provider.text_chat(prompt, session_id=None), 
                     timeout=LLM_TIMEOUT
                 )
-                
-                if not response or not response.completion_text:
-                    continue
-                    
-                data = _parse_llm_json(response.completion_text)
-                # 简单校验结构
-                if isinstance(data, dict) and "topics" in data:
-                    return data
-            except asyncio.TimeoutError:
-                logger.error(f"群聊总结({VERSION}): LLM 请求超时")
+                if resp and resp.completion_text:
+                    data = _parse_llm_json(resp.completion_text)
+                    if data: return data
             except Exception as e:
-                logger.error(f"群聊总结({VERSION}): LLM Error (Attempt {attempt+1}): {e}")
-        
+                logger.error(f"群聊总结({VERSION}): LLM第{i+1}次失败: {e}")
         return None
+
+    # ================= 主入口重构 =================
 
     async def generate_report(self, bot, group_id: str, silent: bool = False) -> Optional[str]:
         try:
-            today_start_ts = self.get_today_start_timestamp()
+            today_ts = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
             
+            # 1. 获取群名
             try:
-                group_info = await bot.api.call_action("get_group_info", group_id=group_id)
-            except Exception:
-                group_info = {"group_name": "未知群聊"}
+                g_info = await bot.api.call_action("get_group_info", group_id=group_id)
+            except:
+                g_info = {"group_name": "未知群聊"}
 
-            # 1. 获取
-            raw_messages = await self._fetch_messages(bot, group_id, today_start_ts)
-            if not raw_messages:
-                if not silent: logger.warning(f"群聊总结({VERSION}): 群 {group_id} 无历史消息")
+            # 2. 拉取
+            raw_msgs = await self._fetch_messages(bot, group_id, today_ts)
+            if not raw_msgs:
+                if not silent: logger.warning(f"群聊总结({VERSION}): 无历史消息")
                 return None
 
-            # 2. 处理
-            valid_msgs, top_users, trend, chat_log = self._process_messages(raw_messages, today_start_ts)
-            if not valid_msgs:
-                if not silent: logger.warning(f"群聊总结({VERSION}): 群 {group_id} 无有效记录")
+            # 3. 处理
+            _, top_users, trend, chat_log = self._process_data(raw_msgs, today_ts)
+            if not chat_log:
+                if not silent: logger.warning(f"群聊总结({VERSION}): 无有效文本消息")
                 return None
 
-            # 3. LLM
-            prompt = self._construct_prompt(chat_log)
-            analysis_data = await self._call_llm(prompt)
-            if not analysis_data:
-                # 兜底数据，防止渲染完全失败
-                analysis_data = {
-                    "topics": [{"time_range": "全天", "summary": "数据分析失败，但大家依然聊得很开心。"}], 
-                    "closing_remark": "总结生成遇到了一点小障碍，请检查 LLM 设置。"
-                }
+            # 4. 分析
+            analysis = await self._run_llm_analysis(chat_log)
+            if not analysis:
+                analysis = {"topics": [], "closing_remark": "分析失败，LLM 未响应。"}
 
-            # 4. 渲染
+            # 5. 渲染
             render_data = {
                 "date": datetime.datetime.now().strftime("%Y.%m.%d"),
                 "top_users": top_users,
                 "trend": trend,
-                "topics": analysis_data.get("topics", []),
-                "summary_text": analysis_data.get("closing_remark", ""),
-                "group_name": group_info.get("group_name", "群聊"),
+                "topics": analysis.get("topics", []),
+                "summary_text": analysis.get("closing_remark", ""),
+                "group_name": g_info.get("group_name", "群聊"),
                 "bot_name": self.bot_name
             }
-            options = {"quality": 95, "device_scale_factor_level": "ultra", "viewport_width": 500}
             
-            return await self.html_render(self.html_template, render_data, options=options)
+            # HTML渲染兼容层
+            if hasattr(self.context, "image_renderer"):
+                return await self.context.image_renderer.render(
+                    self.html_template, render_data, 
+                    quality=95, device_scale_factor_level="ultra", viewport_width=500
+                )
+            else:
+                logger.error(f"群聊总结({VERSION}): 缺少渲染器")
+                return None
 
         except Exception as e:
-            logger.error(f"群聊总结({VERSION}): 生成报告全局异常: {traceback.format_exc()}")
+            logger.error(f"群聊总结({VERSION}): 生成流程异常: {traceback.format_exc()}")
             return None
+
+    # ================= 定时任务 =================
 
     async def run_scheduled_task(self):
         try:
-            logger.info(f"群聊总结({VERSION}): [Step 1] 开始定时推送...")
-            
+            logger.info(f"群聊总结({VERSION}): 定时任务触发")
             bot = await self._get_bot()
             if not bot:
-                logger.warning(f"群聊总结({VERSION}): [Warning] 未捕获 Bot 实例，尝试主动获取...")
-                # 再次尝试冷启动获取
-                bot = await self._get_bot()
-                if not bot:
-                    logger.warning(f"群聊总结({VERSION}): 最终获取 Bot 失败，跳过。")
-                    return
-
-            if not self.push_groups:
-                logger.warning(f"群聊总结({VERSION}): 推送列表为空。")
+                logger.warning(f"群聊总结({VERSION}): 无可用 Bot，跳过。")
                 return
 
-            for group_id in self.push_groups:
-                g_id_str = str(group_id)
+            if not self.push_groups: return
+
+            for gid in self.push_groups:
+                g_str = str(gid)
                 
-                # 使用锁防止自动推送时用户手动触发导致的冲突
-                lock = self._get_group_lock(g_id_str)
-                if lock.locked():
-                    logger.info(f"群聊总结({VERSION}): 群 {g_id_str} 正在进行任务，跳过定时推送")
-                    continue
+                # 并发锁检查
+                lock = self._get_group_lock(g_str)
+                if lock.locked(): continue
 
                 async with lock:
-                    logger.info(f"群聊总结({VERSION}): 正在处理群 {g_id_str}")
                     try:
-                        img_path = await self.generate_report(bot, g_id_str, silent=True)
-                        
-                        if img_path:
-                            cq_code = ""
-                            if img_path.startswith("http"):
-                                cq_code = f"[CQ:image,file={img_path}]"
+                        img = await self.generate_report(bot, g_str, silent=True)
+                        if img:
+                            cq = ""
+                            if img.startswith("http"):
+                                cq = f"[CQ:image,file={img}]"
                             else:
-                                clean_path = str(Path(img_path))
-                                if clean_path.startswith("file:"):
-                                    clean_path = clean_path.replace("file:///", "").replace("file://", "")
+                                # 标准化路径处理
+                                path_obj = Path(urllib.parse.urlparse(img).path)
+                                # Windows 路径修正 (/C:/...)
+                                if os.name == 'nt' and str(path_obj).startswith('\\') and ':' in str(path_obj):
+                                    path_obj = Path(str(path_obj)[1:])
                                 
-                                if os.path.exists(clean_path):
-                                    # 检查文件大小防止超出协议限制
-                                    f_size = os.path.getsize(clean_path)
-                                    # Base64 约增大 33%
-                                    if f_size * 1.35 > MAX_IMAGE_SIZE_BYTES:
-                                        logger.error(f"图片过大 ({f_size} bytes)，跳过发送")
+                                if path_obj.exists():
+                                    # 内存安全检查
+                                    if path_obj.stat().st_size > MAX_IMAGE_SIZE_BYTES:
+                                        logger.error(f"图片过大跳过: {path_obj}")
                                         continue
                                     
-                                    try:
-                                        with open(clean_path, "rb") as image_file:
-                                            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                                        cq_code = f"[CQ:image,file=base64://{encoded_string}]"
-                                    except Exception as file_err:
-                                        logger.error(f"读取图片失败: {file_err}")
-                                        continue
-                                else:
-                                    logger.error(f"群聊总结({VERSION}): 图片文件不存在: {clean_path}")
-
-                            if cq_code:
-                                # 强制转 int 确保兼容性
-                                await bot.api.call_action("send_group_msg", group_id=int(g_id_str), message=cq_code)
-                                logger.info(f"群聊总结({VERSION}): 群 {g_id_str} 推送成功")
-                        else:
-                            logger.info(f"群聊总结({VERSION}): 群 {g_id_str} 无生成内容")
-
+                                    # 内存安全读取 (分块虽然对 b64encode 意义不大，但符合规范)
+                                    # 这里直接读入是为了 encoding，Python base64 暂不支持流式，但做了大小检查
+                                    with open(path_obj, "rb") as f:
+                                        b64 = base64.b64encode(f.read()).decode('utf-8')
+                                    cq = f"[CQ:image,file=base64://{b64}]"
+                            
+                            if cq:
+                                await bot.api.call_action("send_group_msg", group_id=int(g_str), message=cq)
+                                logger.info(f"群聊总结({VERSION}): 群 {g_str} 推送成功")
                     except Exception as e:
-                        logger.error(f"群聊总结({VERSION}): 群 {g_id_str} 推送异常: {e}")
+                        logger.error(f"群聊总结({VERSION}): 群 {g_str} 推送失败: {e}")
                 
                 await asyncio.sleep(PUSH_DELAY_BETWEEN_GROUPS)
-        
-        except Exception as e:
-            logger.error(f"群聊总结({VERSION}): 定时任务严重错误: {traceback.format_exc()}")
 
-    def get_today_start_timestamp(self):
-        now = datetime.datetime.now()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return today_start.timestamp()
+        except Exception as e:
+            logger.error(f"群聊总结({VERSION}): 定时任务崩溃: {traceback.format_exc()}")
