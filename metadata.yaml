@@ -1,6 +1,6 @@
 name: astrbot_plugin_qq_group_summary_danfong
-display_name: QQ群聊总结
+display_name: QQ群聊总结（增强版）
 desc: 基于zhoufan47的原版优化的群聊总结，支持每日定时推送、黑名单过滤、自定义人设风格及全新的UI设计。 
-version: v0.1.27
+version: v0.1.29
 author: danfong1104
 repo: https://github.com/danfong1104/astrbot_plugin_qq_group_summary_danfong
