@@ -5,7 +5,7 @@ import datetime
 import traceback
 import asyncio
 import base64
-import html  # 新增：用于HTML转义
+import html
 import urllib.parse
 from pathlib import Path
 from collections import Counter
@@ -19,27 +19,39 @@ from astrbot.api.star import Context, Star
 from astrbot.api import logger
 
 # --- 全局常量配置 ---
-VERSION = "0.1.30"
+VERSION: str = "0.1.30"
 
 # API Action 常量
-API_GET_GROUP_MSG_HISTORY = "get_group_msg_history"
-API_GET_GROUP_INFO = "get_group_info"
-API_SEND_GROUP_MSG = "send_group_msg"
+API_GET_GROUP_MSG_HISTORY: str = "get_group_msg_history"
+API_GET_GROUP_INFO: str = "get_group_info"
+API_SEND_GROUP_MSG: str = "send_group_msg"
 
 # 逻辑常量
-MAX_RETRY_ATTEMPTS = 3
-LLM_TIMEOUT = 45  # 缩短超时，避免长阻塞
-RETRY_BASE_DELAY = 2.0
-MAX_CONCURRENT_PUSH = 3  # 批量推送时的并发限制
-MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
-ESTIMATED_CHARS_PER_TOKEN = 2  # 估算 1 Token ≈ 2 中文字符
+MAX_RETRY_ATTEMPTS: int = 3
+LLM_TIMEOUT: int = 45  # 缩短超时，避免长阻塞
+API_TIMEOUT: int = 30  # API 调用超时
+RETRY_BASE_DELAY: float = 2.0
+MAX_CONCURRENT_PUSH: int = 3  # 批量推送时的并发限制
+MAX_IMAGE_SIZE_BYTES: int = 10 * 1024 * 1024  # 10MB
+ESTIMATED_CHARS_PER_TOKEN: int = 2  # 估算 1 Token ≈ 2 中文字符
+HISTORY_FETCH_BATCH_SIZE: int = 200 # 每次拉取历史消息条数
+OVERHEAD_CHARS_PER_MSG: int = 15 # 单条消息格式化开销 (时间戳+换行等)
 
 # 平台识别
 PLATFORM_ONEBOT = ("qq", "onebot", "aiocqhttp", "napcat", "llonebot")
 PLATFORM_UNSUPPORTED = ("telegram", "discord", "wechat")
 
 def _parse_llm_json(text: str) -> dict:
-    """鲁棒性 JSON 解析器：寻找最外层 {}，忽略干扰文本"""
+    """
+    鲁棒性 JSON 解析器：寻找最外层 {}，忽略干扰文本
+    
+    已知限制:
+    - 不支持嵌套对象中的转义大括号
+    - 假设 JSON 对象在文本中只出现一次
+    
+    Raises:
+        ValueError: 当无法找到有效 JSON 对象时
+    """
     text = text.strip()
     # 移除 Markdown 代码块
     text = re.sub(r"^```(json)?", "", text, flags=re.MULTILINE).strip()
@@ -77,7 +89,7 @@ class GroupSummaryPlugin(Star):
         self.max_query_rounds = self.config.get("max_query_rounds", 10)
         self.bot_name = self.config.get("bot_name", "BOT")
         self.msg_token_limit = self.config.get("token_limit", 6000)
-        self.exclude_users = set(self.config.get("exclude_users", [])) # 转为set加速查找
+        self.exclude_users = set(self.config.get("exclude_users", [])) 
         self.enable_auto_push = self.config.get("enable_auto_push", False)
         self.push_time = self.config.get("push_time", "23:00")
         self.push_groups = self.config.get("push_groups", [])
@@ -92,7 +104,7 @@ class GroupSummaryPlugin(Star):
         self._bot_lock = asyncio.Lock()
         self._group_locks: Dict[str, asyncio.Lock] = {}
         self.scheduler = None 
-        self._push_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PUSH) # 并发控制
+        self._push_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PUSH)
 
         # 模板加载
         self.template_path = Path(__file__).parent / "templates" / "report.html"
@@ -119,7 +131,7 @@ class GroupSummaryPlugin(Star):
     def setup_schedule(self):
         try:
             if self.scheduler and self.scheduler.running:
-                self.scheduler.shutdown(wait=True) # 等待旧任务清理
+                self.scheduler.shutdown(wait=True) 
             
             self.scheduler = AsyncIOScheduler()
             try:
@@ -138,20 +150,27 @@ class GroupSummaryPlugin(Star):
             if self.scheduler and self.scheduler.running:
                 self.scheduler.shutdown(wait=False)
                 logger.info(f"群聊总结({VERSION}): 定时任务已停止")
-        except Exception as e:
+        except (RuntimeError, AttributeError, Exception) as e:
             logger.error(f"群聊总结({VERSION}): 资源清理失败: {e}")
 
-    # ================= 核心：Bot 获取 (双重保障) =================
+    # ================= 核心：Bot 获取 (双重检查锁定) =================
     async def _get_bot(self, event: Optional[AstrMessageEvent] = None) -> Optional[Any]:
-        async with self._bot_lock:
-            if event and event.bot:
+        # 1. 优先使用当前事件的 Bot
+        if event and event.bot:
+            async with self._bot_lock:
                 self._global_bot = event.bot
-                return event.bot
+            return event.bot
 
+        # 2. 快速路径：读取缓存 (无锁)
+        if self._global_bot:
+            return self._global_bot
+        
+        # 3. 冷启动兜底：遍历 Context
+        async with self._bot_lock:
+            # 双重检查
             if self._global_bot:
                 return self._global_bot
-            
-            # 冷启动兜底：遍历 Context 寻找 OneBot
+
             try:
                 if hasattr(self.context, "get_bots"):
                     bots = self.context.get_bots()
@@ -178,27 +197,38 @@ class GroupSummaryPlugin(Star):
             logger.error(f"群聊总结({VERSION}): 渲染异常: {e}")
             return None
 
-    # ================= 消息处理流水线 (Atomic Methods) =================
+    # ================= 消息处理流水线 =================
+
+    def _is_platform_supported(self, bot) -> bool:
+        """检查当前平台是否支持历史消息拉取"""
+        p_name = getattr(bot, "platform_name", "").lower()
+        # 仅针对已知不支持的平台发警告
+        is_unsupported = any(k in p_name for k in PLATFORM_UNSUPPORTED)
+        if is_unsupported:
+            logger.warning(f"群聊总结({VERSION}): 平台 {p_name} 可能不支持 {API_GET_GROUP_MSG_HISTORY}")
+            return False
+        return True
 
     async def _fetch_messages(self, bot, group_id: str, start_ts: float) -> List[dict]:
-        """拉取历史消息：含协议检查、去重、死循环熔断"""
-        p_name = getattr(bot, "platform_name", "").lower()
-        if any(k in p_name for k in PLATFORM_UNSUPPORTED):
-            logger.warning(f"群聊总结({VERSION}): 平台 {p_name} 可能不支持 {API_GET_GROUP_MSG_HISTORY}")
+        """拉取历史消息：含协议检查、去重、死循环熔断、超时控制"""
+        self._is_platform_supported(bot)
 
         all_msgs = []
         msg_seq = 0
         last_ids = set()
-        
-        # 熔断机制：记录上一次的最旧 seq
         last_min_seq = None 
 
         for _ in range(self.max_query_rounds):
             if len(all_msgs) >= self.max_msg_count: break
 
             try:
-                resp = await bot.api.call_action(API_GET_GROUP_MSG_HISTORY, 
-                    group_id=group_id, count=200, message_seq=msg_seq, reverseOrder=True)
+                # 增加超时控制
+                resp = await asyncio.wait_for(
+                    bot.api.call_action(API_GET_GROUP_MSG_HISTORY, 
+                        group_id=group_id, count=HISTORY_FETCH_BATCH_SIZE, 
+                        message_seq=msg_seq, reverseOrder=True),
+                    timeout=API_TIMEOUT
+                )
                 
                 if not resp or "messages" not in resp: break
                 
@@ -208,28 +238,31 @@ class GroupSummaryPlugin(Star):
 
                 oldest = batch[-1]
                 current_seq = oldest.get('message_seq')
+                current_time = oldest.get('time', 0)
                 
-                # 死循环熔断：如果 seq 没变或为 None，停止
+                # 死循环熔断
                 if current_seq is None or (last_min_seq is not None and current_seq >= last_min_seq):
                     break
                 last_min_seq = current_seq
                 msg_seq = current_seq
 
-                # 收集有效消息 (去重)
+                # 收集有效消息
                 for m in batch:
                     mid = m.get('message_id')
-                    if not mid: continue # 跳过无 ID 消息
+                    if not mid: continue
                     
                     if mid not in last_ids:
                         all_msgs.append(m)
                         last_ids.add(mid)
                 
-                # 边界检查 (严格小于)
-                if oldest.get('time', 0) < start_ts:
+                # 边界检查 (<= 覆盖起始时刻)
+                if current_time <= start_ts:
                     break
                     
+            except asyncio.TimeoutError:
+                logger.warning(f"群聊总结({VERSION}): 获取历史消息超时")
+                break
             except Exception as e:
-                # 仅记录非预期错误
                 if "ActionFailed" not in str(e):
                     logger.error(f"群聊总结({VERSION}): 拉取消息错误: {e}")
                 break
@@ -237,9 +270,9 @@ class GroupSummaryPlugin(Star):
         return all_msgs
 
     def _process_data(self, messages: List[dict], start_ts: float) -> Tuple[List[dict], List[dict], Dict[str, int], str]:
-        """数据清洗与统计：支持 Token 截断、UID 统计"""
+        """数据清洗与统计"""
+        # 使用 <= 确保边界消息不丢失
         valid_msgs = []
-        # 使用 UID 统计更准确，如果没有 UID 则回退到 Nickname
         user_stats = Counter() 
         trend_stats = Counter()
         
@@ -250,7 +283,6 @@ class GroupSummaryPlugin(Star):
             if m.get('time', 0) < start_ts: continue
             
             raw = m.get('raw_message', "")
-            # 正则清洗 CQ 码
             content = re.sub(r'\[CQ:[^\]]+\]', '', raw).strip()
             if not content: continue
             
@@ -258,15 +290,11 @@ class GroupSummaryPlugin(Star):
             nick = sender.get('card') or sender.get('nickname') or "未知用户"
             uid = str(sender.get('user_id', ''))
             
-            # 黑名单 (同时检查 nick 和 uid)
             if nick in self.exclude_users or uid in self.exclude_users:
                 continue
 
-            # 统计 key 优先用 nick (用于展示)，实际逻辑可优化为 uid map nick
-            # 这里为了简单展示，直接统计 nick
+            # 统计展示用
             user_stats[nick] += 1
-            
-            # 趋势统计 (补齐两位 00-23)
             hour = datetime.datetime.fromtimestamp(m['time']).strftime("%H")
             trend_stats[hour] += 1
 
@@ -276,21 +304,23 @@ class GroupSummaryPlugin(Star):
                 "content": content
             })
 
-        top_users = [{"name": k, "count": v} for k, v in user_stats.most_common(5)]
+        # 安全转义 Top Users
+        top_users = [
+            {"name": html.escape(k), "count": v} 
+            for k, v in user_stats.most_common(5)
+        ]
         
-        # 排序：按时间正序，准备生成 ChatLog
         valid_msgs.sort(key=lambda x: x['time'])
         
-        # --- 真实字符截断逻辑 ---
-        # 从最新的消息开始累加，直到超过 char_limit
+        # 字符级截断逻辑
         accumulated_chars = 0
         final_msgs = []
         for msg in reversed(valid_msgs):
-            # 估算单条开销: 内容 + 名字 + 时间戳 + 换行
-            cost = len(msg['content']) + len(msg['name']) + 15 
+            # 内容 + 名字 + 额外开销
+            cost = len(msg['content']) + len(msg['name']) + OVERHEAD_CHARS_PER_MSG
             if accumulated_chars + cost > char_limit:
                 break
-            final_msgs.insert(0, msg) # 保持正序插入
+            final_msgs.insert(0, msg) 
             accumulated_chars += cost
         
         chat_log = "\n".join([
@@ -317,65 +347,66 @@ class GroupSummaryPlugin(Star):
         {chat_log}
         """
 
-        for i in range(MAX_RETRY_ATTEMPTS):
+        for attempt in range(MAX_RETRY_ATTEMPTS):
             try:
-                if i > 0: await asyncio.sleep(RETRY_BASE_DELAY * (2 ** i))
-                
-                resp = await asyncio.wait_for(
+                if attempt > 0: 
+                    await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+
+                # 增加超时控制
+                response = await asyncio.wait_for(
                     provider.text_chat(prompt, session_id=None), 
                     timeout=LLM_TIMEOUT
                 )
-                if resp and resp.completion_text:
-                    data = _parse_llm_json(resp.completion_text)
-                    # 简单校验
-                    if isinstance(data, dict) and ("topics" in data or "closing_remark" in data):
-                        return data
+                
+                if resp := response:
+                    if resp.completion_text:
+                        data = _parse_llm_json(resp.completion_text)
+                        if isinstance(data, dict): return data
             except Exception as e:
-                logger.error(f"群聊总结({VERSION}): LLM第{i+1}次异常: {e}")
+                logger.error(f"群聊总结({VERSION}): LLM第{attempt+1}次异常: {e}")
         return None
 
     # ================= 流程总控 =================
 
     async def generate_report(self, bot, group_id: str, silent: bool = False) -> Optional[str]:
         try:
-            # 1. 初始化
-            today = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            today_ts = today.timestamp()
+            today_ts = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
             
-            # 2. 获取群名 (API 类型兼容：get_group_info 接受 str)
             try:
-                g_info = await bot.api.call_action(API_GET_GROUP_INFO, group_id=str(group_id))
+                # 增加超时控制
+                g_info = await asyncio.wait_for(
+                    bot.api.call_action(API_GET_GROUP_INFO, group_id=str(group_id)),
+                    timeout=API_TIMEOUT
+                )
             except:
                 g_info = {"group_name": "群聊"}
 
-            # 3. 拉取消息
             raw_msgs = await self._fetch_messages(bot, str(group_id), today_ts)
             if not raw_msgs:
                 if not silent: logger.warning(f"群聊总结({VERSION}): {group_id} 无新消息")
                 return None
 
-            # 4. 数据处理
             _, top_users, trend, chat_log = self._process_data(raw_msgs, today_ts)
             if not chat_log:
                 if not silent: logger.warning(f"群聊总结({VERSION}): {group_id} 无有效文本")
                 return None
 
-            # 5. LLM 分析
             analysis = await self._run_llm(chat_log)
             if not analysis:
                 analysis = {"topics": [], "closing_remark": "分析超时，生成失败。"}
 
-            # 6. 安全渲染 (HTML转义)
+            # 安全渲染 (HTML转义)
             safe_group_name = html.escape(g_info.get("group_name", "群聊"))
             safe_topics = [
-                {"time_range": html.escape(str(t.get("time_range",""))), "summary": html.escape(str(t.get("summary","")))} 
+                {"time_range": html.escape(str(t.get("time_range",""))), 
+                 "summary": html.escape(str(t.get("summary","")))} 
                 for t in analysis.get("topics", [])
             ]
             safe_remark = html.escape(str(analysis.get("closing_remark", "")))
 
             render_data = {
-                "date": today.strftime("%Y.%m.%d"),
-                "top_users": top_users, # 内部已清洗
+                "date": datetime.datetime.now().strftime("%Y.%m.%d"),
+                "top_users": top_users,
                 "trend": trend,
                 "topics": safe_topics,
                 "summary_text": safe_remark,
@@ -453,7 +484,6 @@ class GroupSummaryPlugin(Star):
 
             if not self.push_groups: return
 
-            # 使用信号量控制并发，防止瞬间并发过高
             tasks = []
             for gid in self.push_groups:
                 tasks.append(self._push_single_group(bot, str(gid)))
@@ -467,7 +497,7 @@ class GroupSummaryPlugin(Star):
         """单个群推送逻辑 (受信号量控制)"""
         async with self._push_semaphore:
             lock = self._get_group_lock(gid)
-            if lock.locked(): return # 跳过正在手动执行的群
+            if lock.locked(): return 
 
             async with lock:
                 try:
@@ -477,14 +507,13 @@ class GroupSummaryPlugin(Star):
                     if img:
                         cq = self._prepare_cq_code(img)
                         if cq:
-                            # 强制转 int 以兼容 send_group_msg
+                            # 强制转 int 以兼容 API
                             await bot.api.call_action(API_SEND_GROUP_MSG, group_id=int(gid), message=cq)
                             logger.info(f"群聊总结({VERSION}): {gid} 推送成功")
                 except Exception as e:
                     logger.error(f"群聊总结({VERSION}): {gid} 推送失败: {e}")
                 
-                # 任务间微小间隔
-                await asyncio.sleep(1)
+                await asyncio.sleep(PUSH_DELAY_BETWEEN_GROUPS)
 
     def _prepare_cq_code(self, img_path: str) -> Optional[str]:
         """构建图片 CQ 码，处理路径与 Base64"""
@@ -492,17 +521,17 @@ class GroupSummaryPlugin(Star):
             return f"[CQ:image,file={img_path}]"
         
         try:
-            path_obj = Path(urllib.parse.urlparse(img_path).path)
-            # Windows 兼容
-            if os.name == 'nt' and str(path_obj).startswith('\\') and ':' in str(path_obj):
-                path_obj = Path(str(path_obj)[1:])
+            # 路径安全性检查
+            path_obj = Path(urllib.parse.urlparse(img_path).path).resolve()
             
+            # 简单的路径合法性检查（确保文件确实存在且可读）
             if not path_obj.exists():
                 logger.error(f"图片丢失: {path_obj}")
                 return None
 
+            # 内存熔断：检查文件大小
             if path_obj.stat().st_size > MAX_IMAGE_SIZE_BYTES:
-                logger.error(f"图片过大跳过")
+                logger.error(f"图片过大跳过: {path_obj}")
                 return None
 
             # 内存安全读取
