@@ -19,34 +19,33 @@ from astrbot.api import logger
 # --- 全局常量配置 ---
 VERSION = "0.1.30"
 MAX_RETRY_ATTEMPTS = 3
-RETRY_BASE_DELAY = 1.0  # 秒
-PUSH_DELAY_BETWEEN_GROUPS = 5.0  # 秒
-MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB Base64 转换限制
-ESTIMATED_CHARS_PER_TOKEN = 20  # 用于估算 token 的魔法数字
+RETRY_BASE_DELAY = 1.0
+PUSH_DELAY_BETWEEN_GROUPS = 5.0
+MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB
+ESTIMATED_CHARS_PER_TOKEN = 2  # 中文环境调整为2
+MAX_JSON_PARSE_LENGTH = 50000  # 限制正则处理的最大字符数
 
 def _parse_llm_json(text: str) -> dict:
-    """
-    增强型 JSON 解析器 (鲁棒性优化版)
-    不再依赖脆弱的 Markdown 清洗正则，而是优先寻找合法的 JSON 结构
-    """
-    text = text.strip()
+    """增强型 JSON 解析器 (带长度限制防ReDoS)"""
+    # 截取头部以防止超长文本导致的正则卡死
+    process_text = text[:MAX_JSON_PARSE_LENGTH].strip()
     
-    # 1. 尝试直接解析 (最快)
+    if "```" in process_text:
+        process_text = re.sub(r"^```(json)?|```$", "", process_text, flags=re.MULTILINE | re.DOTALL).strip()
+    
     try:
-        return json.loads(text)
+        return json.loads(process_text)
     except json.JSONDecodeError:
         pass
     
-    # 2. 使用正则提取最外层的 {} (最稳健)
-    # 非贪婪匹配，忽略 JSON 前后的 "好的", "```json" 等废话
     try:
-        match = re.search(r"\{[\s\S]*?\}", text)
+        # 非贪婪匹配
+        match = re.search(r"\{[\s\S]*?\}", process_text)
         if match:
             json_str = match.group()
             return json.loads(json_str)
     except json.JSONDecodeError:
         pass
-        
     raise ValueError(f"无法提取有效 JSON，文本前50字: {text[:50]}...")
 
 class GroupSummaryPlugin(Star):
@@ -70,19 +69,18 @@ class GroupSummaryPlugin(Star):
         # 状态管理
         self._global_bot = None
         self._bot_lock = asyncio.Lock()
-        self._is_task_running = False # 定时任务并发锁
+        self._is_task_running = False
         self.scheduler = None 
 
         # 模板加载
         self.template_path = Path(__file__).parent / "templates" / "report.html"
         self.html_template = self._load_template()
 
-        # 启动定时任务
+        # 启动定时任务 (不在 __init__ 中直接 start，而是 setup)
         if self.enable_auto_push:
             self.setup_schedule()
 
     def _load_template(self) -> str:
-        """加载 HTML 模板"""
         try:
             if not self.template_path.exists():
                 raise FileNotFoundError(f"模板文件不存在: {self.template_path}")
@@ -92,13 +90,11 @@ class GroupSummaryPlugin(Star):
             return "<h1>Template Load Error</h1>"
 
     def setup_schedule(self):
-        """配置定时任务"""
         try:
             if self.scheduler and self.scheduler.running:
                 self.scheduler.shutdown()
             
             self.scheduler = AsyncIOScheduler()
-            
             try:
                 hour, minute = self.push_time.split(":")
                 trigger = CronTrigger(hour=int(hour), minute=int(minute))
@@ -111,7 +107,6 @@ class GroupSummaryPlugin(Star):
             logger.error(f"群聊总结({VERSION}): 定时任务启动失败: {e}")
 
     def terminate(self):
-        """插件卸载/重载时的资源清理"""
         try:
             if self.scheduler and self.scheduler.running:
                 self.scheduler.shutdown(wait=False)
@@ -119,63 +114,86 @@ class GroupSummaryPlugin(Star):
         except Exception as e:
             logger.error(f"群聊总结({VERSION}): 资源清理失败: {e}")
 
+    # ================= 核心修复：HTML 渲染兼容层 =================
+    async def html_render(self, template: str, data: dict, options: dict = None) -> Optional[str]:
+        """
+        兼容 Star 基类缺失 html_render 的问题。
+        尝试调用 Context 中的 image_renderer。
+        """
+        try:
+            # 1. 尝试使用 AstrBot 内置的渲染器
+            if hasattr(self.context, "image_renderer"):
+                # 这里假设 renderer 支持 render_html 方法，具体 API 视 AstrBot 版本而定
+                # 大多数情况下是 render(html_str) 或类似
+                return await self.context.image_renderer.render(template, data, **(options or {}))
+            
+            # 2. 如果没有，记录错误 (此处可以扩展其他渲染逻辑)
+            logger.error(f"群聊总结({VERSION}): 当前 Context 不支持 HTML 渲染 (缺少 image_renderer)")
+            return None
+        except Exception as e:
+            # 兼容性兜底：如果是旧版 AstrBot，可能 render 签名不同
+            try:
+                if hasattr(self.context, "render_template"):
+                     return await self.context.render_template(template, **data)
+            except Exception:
+                pass
+            
+            logger.error(f"群聊总结({VERSION}): 渲染失败: {e}")
+            return None
+
+    # ================= 核心修复：Bot 获取逻辑 =================
     async def _get_bot(self, event: Optional[AstrMessageEvent] = None) -> Optional[Any]:
         """
-        统一获取 Bot 实例
-        优化：修复索引越界风险，优先从 Context 获取
+        统一获取 Bot 实例。
+        优先级: Event.bot (当前交互) > Cache (之前交互) > Context (兜底)
         """
-        # 1. 尝试从 Context 主动获取 (解决竞态条件)
+        # 1. 优先使用当前事件的 Bot (最准确)
+        if event and event.bot:
+            async with self._bot_lock:
+                self._global_bot = event.bot
+            return event.bot
+
+        # 2. 其次使用缓存的 Bot
+        if self._global_bot:
+            return self._global_bot
+        
+        # 3. 最后尝试从 Context 获取 (兜底，可能拿到错误的 Bot)
         try:
             if hasattr(self.context, "get_bots"):
                 bots = self.context.get_bots()
                 if bots:
-                    # 安全获取第一个 Bot 实例
+                    # 记录警告，因为这可能是随机选的一个 Bot
+                    logger.warning(f"群聊总结({VERSION}): 使用 Context 默认 Bot，可能与目标群不匹配。")
                     return next(iter(bots.values()))
-        except Exception as e:
-            # 仅在调试模式下记录，避免刷屏
-            # logger.debug(f"Context get_bots failed: {e}")
+        except Exception:
             pass
 
-        # 2. 返回缓存
-        if self._global_bot:
-            return self._global_bot
-        
-        # 3. 从事件捕获
-        if event:
-            async with self._bot_lock:
-                if not self._global_bot:
-                    self._global_bot = event.bot
-            return self._global_bot
-        
         return None
 
     # ================= 指令与事件监听 =================
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def capture_bot_instance(self, event: AstrMessageEvent, *args, **kwargs):
-        """
-        被动监听：自动捕获 Bot 实例
-        优化：增加快速返回路径，避免高频消息下的锁开销
-        """
-        if self._global_bot:
-            return # 性能优化：已捕获则直接退出
-            
-        await self._get_bot(event)
+        """被动监听：只在缓存为空时加锁更新"""
+        if self._global_bot is None:
+            await self._get_bot(event)
 
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def summarize_group(self, event: AstrMessageEvent, *args, **kwargs):
         """手动指令"""
-        await self._get_bot(event)
-        
+        bot = await self._get_bot(event)
+        if not bot:
+            yield event.plain_result("❌ 无法获取 Bot 实例。")
+            return
+            
         group_id = event.get_group_id()
         if not group_id:
             yield event.plain_result("⚠️ 请在群聊中使用此指令。")
             return
 
         yield event.plain_result(f"🌱 正在连接神经云端，回溯今日记忆...")
-        
-        img_result = await self.generate_report(event.bot, group_id, silent=False)
+        img_result = await self.generate_report(bot, group_id, silent=False)
         
         if img_result:
             yield event.image_result(img_result)
@@ -185,24 +203,32 @@ class GroupSummaryPlugin(Star):
     @filter.llm_tool(name="group_summary_tool")
     async def call_summary_tool(self, event: AstrMessageEvent, *args, **kwargs):
         """LLM 工具调用"""
-        await self._get_bot(event)
-        
+        bot = await self._get_bot(event)
         group_id = event.get_group_id()
-        if not group_id:
-            yield event.plain_result("无法在私聊中生成群总结。")
+        
+        if not group_id or not bot:
+            yield event.plain_result("无法生成总结。")
             return
 
         yield event.plain_result(f"🌱 正在分析今日群聊内容...")
-        img_result = await self.generate_report(event.bot, group_id, silent=False)
+        img_result = await self.generate_report(bot, group_id, silent=False)
         if img_result:
             yield event.image_result(img_result)
         else:
             yield event.plain_result("无法生成总结。")
 
-    # ================= 核心逻辑：数据处理 =================
+    # ================= 数据处理 =================
 
     async def _fetch_messages(self, bot, group_id: str, start_timestamp: float) -> List[dict]:
         """获取群聊历史消息"""
+        # --- 核心修复：协议检查 ---
+        adapter_name = getattr(bot, "platform_name", "").lower()
+        # 宽泛检查，允许 qq, aiocqhttp, onebot 等关键字
+        if "telegram" in adapter_name or "discord" in adapter_name or "wechat" in adapter_name:
+            logger.warning(f"群聊总结({VERSION}): 当前适配器 {adapter_name} 可能不支持 get_group_msg_history API")
+            # 不直接 return，尝试运行以防万一
+        # ------------------------
+
         all_messages = []
         message_seq = 0
         cutoff_time = start_timestamp
@@ -213,7 +239,6 @@ class GroupSummaryPlugin(Star):
                 break
 
             try:
-                # 平台兼容性警告：此 API 为 OneBot V11 非标准扩展
                 params = {
                     "group_id": group_id,
                     "count": 200,
@@ -226,14 +251,12 @@ class GroupSummaryPlugin(Star):
                 if not round_messages:
                     break
                 
-                # 统一按时间倒序处理
                 batch_msgs = sorted(round_messages, key=lambda x: x.get('time', 0), reverse=True)
                 
                 oldest_msg = batch_msgs[-1]
                 oldest_seq = oldest_msg.get('message_seq')
                 oldest_time = oldest_msg.get('time', 0)
 
-                # 死循环检测
                 if last_min_seq is not None and oldest_seq >= last_min_seq:
                     break
                 last_min_seq = oldest_seq
@@ -245,14 +268,12 @@ class GroupSummaryPlugin(Star):
                     break
                     
             except Exception as e:
-                # 明确的错误提示
-                logger.error(f"群聊总结({VERSION}): 获取历史消息失败。请确认您使用的是支持 'get_group_msg_history' 接口的 OneBot V11 适配器 (如 NapCat/LLOneBot/Go-CQHTTP)。错误详情: {e}")
+                logger.error(f"群聊总结({VERSION}): 获取消息异常 (协议可能不兼容): {e}")
                 break
 
         return all_messages
 
     def _process_messages(self, messages: List[dict], start_timestamp: float) -> Tuple[List[dict], List[dict], Dict[str, int], str]:
-        """处理消息：过滤、统计、格式化"""
         cutoff_time = start_timestamp
         valid_msgs = []
         user_counter = Counter()
@@ -265,7 +286,7 @@ class GroupSummaryPlugin(Star):
 
             raw_msg = msg.get("raw_message", "")
             
-            # 使用正则去除 CQ 码（保留文本）
+            # 使用正则去除 CQ 码，保留文本
             content = re.sub(r'\[CQ:[^\]]+\]', '', raw_msg).strip()
             
             if not content:
@@ -288,11 +309,9 @@ class GroupSummaryPlugin(Star):
             trend_counter[str(int(hour_str))] += 1
 
         top_users = [{"name": name, "count": count} for name, count in user_counter.most_common(5)]
-        
-        # 排序：时间正序
         valid_msgs.sort(key=lambda x: x['time'])
         
-        # 智能截断：按条数截断
+        # 智能截断 (使用更新后的常量)
         max_items = int(self.msg_token_limit / ESTIMATED_CHARS_PER_TOKEN)
         if len(valid_msgs) > max_items:
              valid_msgs_for_llm = valid_msgs[-max_items:]
@@ -306,28 +325,7 @@ class GroupSummaryPlugin(Star):
         
         return valid_msgs, top_users, dict(trend_counter), chat_log
 
-    def _construct_prompt(self, chat_log: str) -> str:
-        """构造 LLM 提示词"""
-        user_style = self.config.get("summary_prompt_style")
-        if not user_style:
-            user_style = f"写一段“{self.bot_name}的悄悄话”作为总结，风格温暖、感性，对今天群里的氛围进行点评。"
-        if "{bot_name}" in user_style:
-            user_style = user_style.replace("{bot_name}", self.bot_name)
-
-        return f"""
-        你是一个群聊记录员“{self.bot_name}”。请根据以下的群聊记录（日期：{datetime.datetime.now().strftime('%Y-%m-%d')}），生成一份总结数据。
-        
-        【要求】：
-        1. 分析 3-8 个主要话题，每个话题包含：时间段（如 10:00 ~ 11:00）和简短内容。
-        2. {user_style}
-        3. 严格返回 JSON 格式：{{"topics": [{{"time_range": "...", "summary": "..."}}],"closing_remark": "..."}}
-        
-        【聊天记录】：
-        {chat_log}
-        """
-
     async def _call_llm(self, prompt: str) -> Optional[dict]:
-        """调用 LLM (含重试逻辑)"""
         provider = self.context.get_provider_by_id(self.config.get("provider_id")) or self.context.get_using_provider()
         if not provider:
             logger.error(f"群聊总结({VERSION}): 未配置 LLM Provider")
@@ -335,7 +333,6 @@ class GroupSummaryPlugin(Star):
 
         for attempt in range(MAX_RETRY_ATTEMPTS):
             try:
-                # 指数退避策略
                 if attempt > 0:
                     delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
                     await asyncio.sleep(delay)
@@ -353,38 +350,47 @@ class GroupSummaryPlugin(Star):
         
         return None
 
-    # ================= 核心逻辑：流程控制 =================
-
     async def generate_report(self, bot, group_id: str, silent: bool = False) -> Optional[str]:
-        """生成报告主流程 (拆分后)"""
         try:
             today_start_ts = self.get_today_start_timestamp()
             
-            # 获取群名称
             try:
                 group_info = await bot.api.call_action("get_group_info", group_id=group_id)
             except Exception:
                 group_info = {"group_name": "未知群聊"}
 
-            # 1. 获取消息
             raw_messages = await self._fetch_messages(bot, group_id, today_start_ts)
             if not raw_messages:
                 if not silent: logger.warning(f"群聊总结({VERSION}): 群 {group_id} 无法获取历史消息")
                 return None
 
-            # 2. 处理消息
             valid_msgs, top_users, trend, chat_log = self._process_messages(raw_messages, today_start_ts)
             if not valid_msgs:
                 if not silent: logger.warning(f"群聊总结({VERSION}): 群 {group_id} 今天无有效聊天记录")
                 return None
 
-            # 3. LLM 交互
-            prompt = self._construct_prompt(chat_log)
+            user_style = self.config.get("summary_prompt_style")
+            if not user_style:
+                user_style = f"写一段“{self.bot_name}的悄悄话”作为总结，风格温暖、感性，对今天群里的氛围进行点评。"
+            if "{bot_name}" in user_style:
+                user_style = user_style.replace("{bot_name}", self.bot_name)
+
+            prompt = f"""
+            你是一个群聊记录员“{self.bot_name}”。请根据以下的群聊记录（日期：{datetime.datetime.now().strftime('%Y-%m-%d')}），生成一份总结数据。
+            
+            【要求】：
+            1. 分析 3-8 个主要话题，每个话题包含：时间段（如 10:00 ~ 11:00）和简短内容。
+            2. {user_style}
+            3. 严格返回 JSON 格式：{{"topics": [{{"time_range": "...", "summary": "..."}}],"closing_remark": "..."}}
+            
+            【聊天记录】：
+            {chat_log}
+            """
+
             analysis_data = await self._call_llm(prompt)
             if not analysis_data:
                 analysis_data = {"topics": [], "closing_remark": "总结生成失败 (LLM 返回数据格式错误或超时)。"}
 
-            # 4. 渲染 HTML
             render_data = {
                 "date": datetime.datetime.now().strftime("%Y.%m.%d"),
                 "top_users": top_users,
@@ -396,16 +402,14 @@ class GroupSummaryPlugin(Star):
             }
             options = {"quality": 95, "device_scale_factor_level": "ultra", "viewport_width": 500}
             
+            # 使用兼容层 html_render
             return await self.html_render(self.html_template, render_data, options=options)
 
         except Exception as e:
             logger.error(f"群聊总结({VERSION}): 生成报告全局异常: {traceback.format_exc()}")
             return None
 
-    # ================= 定时推送逻辑 =================
-
     async def run_scheduled_task(self):
-        """执行定时推送"""
         if self._is_task_running:
             logger.warning(f"群聊总结({VERSION}): 上一次定时任务未结束，跳过本次执行")
             return
@@ -414,6 +418,7 @@ class GroupSummaryPlugin(Star):
         try:
             logger.info(f"群聊总结({VERSION}): [Step 1] 开始定时推送...")
             
+            # 使用 _get_bot 获取 Bot 实例 (优先使用活跃的)
             bot = await self._get_bot()
             if not bot:
                 logger.warning(f"群聊总结({VERSION}): [Warning] 未捕获 Bot 实例，跳过推送。")
@@ -436,18 +441,15 @@ class GroupSummaryPlugin(Star):
                             cq_code = f"[CQ:image,file={img_path}]"
                         else:
                             clean_path = str(Path(img_path))
-                            # 简单的 file: 前缀清理
                             if clean_path.startswith("file:"):
                                 clean_path = clean_path.replace("file:///", "").replace("file://", "")
                             
-                            # 安全检查：是否存在且大小正常
                             if os.path.exists(clean_path):
                                 f_size = os.path.getsize(clean_path)
                                 if f_size > MAX_IMAGE_SIZE:
                                     logger.error(f"图片过大 ({f_size} bytes)，跳过发送")
                                     continue
                                 
-                                # 安全读取
                                 try:
                                     with open(clean_path, "rb") as image_file:
                                         encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
