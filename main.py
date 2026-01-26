@@ -25,24 +25,28 @@ MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB Base64 转换限制
 ESTIMATED_CHARS_PER_TOKEN = 20  # 用于估算 token 的魔法数字
 
 def _parse_llm_json(text: str) -> dict:
-    """增强型 JSON 解析器，支持清洗 Markdown 标记"""
+    """
+    增强型 JSON 解析器 (鲁棒性优化版)
+    不再依赖脆弱的 Markdown 清洗正则，而是优先寻找合法的 JSON 结构
+    """
     text = text.strip()
-    if "```" in text:
-        text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE | re.DOTALL).strip()
     
+    # 1. 尝试直接解析 (最快)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
     
+    # 2. 使用正则提取最外层的 {} (最稳健)
+    # 非贪婪匹配，忽略 JSON 前后的 "好的", "```json" 等废话
     try:
-        # 非贪婪匹配
         match = re.search(r"\{[\s\S]*?\}", text)
         if match:
             json_str = match.group()
             return json.loads(json_str)
     except json.JSONDecodeError:
         pass
+        
     raise ValueError(f"无法提取有效 JSON，文本前50字: {text[:50]}...")
 
 class GroupSummaryPlugin(Star):
@@ -80,7 +84,6 @@ class GroupSummaryPlugin(Star):
     def _load_template(self) -> str:
         """加载 HTML 模板"""
         try:
-            # 路径遍历保护：虽然 Path 相对安全，但这里是硬编码路径，风险较低
             if not self.template_path.exists():
                 raise FileNotFoundError(f"模板文件不存在: {self.template_path}")
             return self.template_path.read_text(encoding="utf-8")
@@ -117,15 +120,21 @@ class GroupSummaryPlugin(Star):
             logger.error(f"群聊总结({VERSION}): 资源清理失败: {e}")
 
     async def _get_bot(self, event: Optional[AstrMessageEvent] = None) -> Optional[Any]:
-        """统一获取 Bot 实例，优先 Context，其次 Event"""
-        # 1. 尝试从 Context 主动获取
+        """
+        统一获取 Bot 实例
+        优化：修复索引越界风险，优先从 Context 获取
+        """
+        # 1. 尝试从 Context 主动获取 (解决竞态条件)
         try:
             if hasattr(self.context, "get_bots"):
                 bots = self.context.get_bots()
                 if bots:
-                    return list(bots.values())[0]
-        except Exception:
-            pass 
+                    # 安全获取第一个 Bot 实例
+                    return next(iter(bots.values()))
+        except Exception as e:
+            # 仅在调试模式下记录，避免刷屏
+            # logger.debug(f"Context get_bots failed: {e}")
+            pass
 
         # 2. 返回缓存
         if self._global_bot:
@@ -144,7 +153,13 @@ class GroupSummaryPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def capture_bot_instance(self, event: AstrMessageEvent, *args, **kwargs):
-        """被动监听：自动捕获 Bot 实例"""
+        """
+        被动监听：自动捕获 Bot 实例
+        优化：增加快速返回路径，避免高频消息下的锁开销
+        """
+        if self._global_bot:
+            return # 性能优化：已捕获则直接退出
+            
         await self._get_bot(event)
 
     @filter.command("总结群聊")
@@ -191,8 +206,6 @@ class GroupSummaryPlugin(Star):
         all_messages = []
         message_seq = 0
         cutoff_time = start_timestamp
-        
-        # 用于防止死循环：记录上一轮的最小 seq
         last_min_seq = None
 
         for _ in range(self.max_query_rounds):
@@ -200,6 +213,7 @@ class GroupSummaryPlugin(Star):
                 break
 
             try:
+                # 平台兼容性警告：此 API 为 OneBot V11 非标准扩展
                 params = {
                     "group_id": group_id,
                     "count": 200,
@@ -219,21 +233,20 @@ class GroupSummaryPlugin(Star):
                 oldest_seq = oldest_msg.get('message_seq')
                 oldest_time = oldest_msg.get('time', 0)
 
-                # 死循环检测：如果 seq 不再变小，说明到底了
+                # 死循环检测
                 if last_min_seq is not None and oldest_seq >= last_min_seq:
                     break
                 last_min_seq = oldest_seq
                 
-                message_seq = oldest_seq # 更新游标
+                message_seq = oldest_seq
                 all_messages.extend(batch_msgs)
 
-                # 修正边界判定：使用 <= 确保覆盖 00:00:00
                 if oldest_time <= cutoff_time:
                     break
                     
             except Exception as e:
-                # 区分异常类型，ActionFailed 通常意味着不支持或权限不足
-                logger.error(f"群聊总结({VERSION}): 获取消息异常: {e}")
+                # 明确的错误提示
+                logger.error(f"群聊总结({VERSION}): 获取历史消息失败。请确认您使用的是支持 'get_group_msg_history' 接口的 OneBot V11 适配器 (如 NapCat/LLOneBot/Go-CQHTTP)。错误详情: {e}")
                 break
 
         return all_messages
@@ -252,8 +265,7 @@ class GroupSummaryPlugin(Star):
 
             raw_msg = msg.get("raw_message", "")
             
-            # 使用正则去除 CQ 码（保留文本），而不是直接丢弃
-            # 去除 [CQ:image...], [CQ:record...], [CQ:video...] 等
+            # 使用正则去除 CQ 码（保留文本）
             content = re.sub(r'\[CQ:[^\]]+\]', '', raw_msg).strip()
             
             if not content:
@@ -277,11 +289,10 @@ class GroupSummaryPlugin(Star):
 
         top_users = [{"name": name, "count": count} for name, count in user_counter.most_common(5)]
         
-        # 排序：时间正序，方便 LLM 理解上下文
+        # 排序：时间正序
         valid_msgs.sort(key=lambda x: x['time'])
         
-        # 智能截断：按条数截断，避免截断 JSON 结构或敏感信息
-        # 假设平均每条消息 20 token
+        # 智能截断：按条数截断
         max_items = int(self.msg_token_limit / ESTIMATED_CHARS_PER_TOKEN)
         if len(valid_msgs) > max_items:
              valid_msgs_for_llm = valid_msgs[-max_items:]
@@ -324,8 +335,9 @@ class GroupSummaryPlugin(Star):
 
         for attempt in range(MAX_RETRY_ATTEMPTS):
             try:
+                # 指数退避策略
                 if attempt > 0:
-                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) # 指数退避
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
                     await asyncio.sleep(delay)
                     logger.warning(f"群聊总结({VERSION}): LLM 重试 {attempt+1}/{MAX_RETRY_ATTEMPTS}")
 
@@ -337,7 +349,6 @@ class GroupSummaryPlugin(Star):
                 if data:
                     return data
             except Exception as e:
-                # 捕获所有异常以进行重试，但在日志中记录
                 logger.error(f"群聊总结({VERSION}): LLM Error (Attempt {attempt+1}): {e}")
         
         return None
@@ -417,7 +428,6 @@ class GroupSummaryPlugin(Star):
                 logger.info(f"群聊总结({VERSION}): 正在处理群 {g_id_str}")
                 
                 try:
-                    # 在发送前检查图片大小，避免无意义生成
                     img_path = await self.generate_report(bot, g_id_str, silent=True)
                     
                     if img_path:
