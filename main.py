@@ -7,6 +7,7 @@ import asyncio
 import base64
 import html
 import urllib.parse
+import textwrap
 from pathlib import Path
 from collections import Counter
 from typing import List, Dict, Tuple, Optional, Any, Set
@@ -19,7 +20,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 # --- 全局常量配置 ---
-VERSION = "0.1.33" # 修复参数签名问题
+VERSION = "0.1.34"
 
 # API Action 常量
 API_GET_GROUP_MSG_HISTORY = "get_group_msg_history"
@@ -32,7 +33,7 @@ LLM_TIMEOUT = 60
 API_TIMEOUT = 30
 RETRY_BASE_DELAY = 2.0
 MAX_CONCURRENT_PUSH = 3
-MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
 ESTIMATED_CHARS_PER_TOKEN = 2
 HISTORY_FETCH_BATCH_SIZE = 200
 OVERHEAD_CHARS_PER_MSG = 15
@@ -42,7 +43,7 @@ PLATFORM_ONEBOT = ("qq", "onebot", "aiocqhttp", "napcat", "llonebot")
 PLATFORM_UNSUPPORTED = ("telegram", "discord", "wechat")
 
 def _parse_llm_json(text: str) -> dict:
-    """鲁棒性 JSON 解析器：寻找最外层 {}，忽略干扰文本"""
+    """鲁棒性 JSON 解析器"""
     text = text.strip()
     text = re.sub(r"^```(json)?", "", text, flags=re.MULTILINE).strip()
     text = re.sub(r"```$", "", text, flags=re.MULTILINE).strip()
@@ -68,7 +69,7 @@ def _parse_llm_json(text: str) -> dict:
 
     raise ValueError(f"JSON 解析失败，内容片段: {text[:50]}...")
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.33")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.34")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -182,15 +183,11 @@ class GroupSummaryPlugin(Star):
 
     # ================= 消息处理流水线 =================
 
-    def _is_platform_supported(self, bot) -> bool:
+    async def _fetch_messages(self, bot, group_id: str, start_ts: float) -> List[dict]:
         p_name = getattr(bot, "platform_name", "").lower()
         if any(k in p_name for k in PLATFORM_UNSUPPORTED):
             logger.warning(f"群聊总结({VERSION}): 平台 {p_name} 可能不支持 {API_GET_GROUP_MSG_HISTORY}")
-            return False
-        return True
 
-    async def _fetch_messages(self, bot, group_id: str, start_ts: float) -> List[dict]:
-        self._is_platform_supported(bot)
         all_msgs = []
         msg_seq = 0
         last_ids = set()
@@ -299,7 +296,7 @@ class GroupSummaryPlugin(Star):
         provider = self.context.get_provider_by_id(self.config.get("provider_id")) or self.context.get_using_provider()
         if not provider: return None
 
-        prompt = f"""
+        prompt = textwrap.dedent(f"""
         角色：{self.bot_name}。任务：群聊总结。
         要求：
         1. 提取3-8个话题(时间段+摘要)。
@@ -308,8 +305,10 @@ class GroupSummaryPlugin(Star):
         格式：{{"topics": [{{"time_range":"", "summary":""}}], "closing_remark":""}}
         
         记录：
+        <chat_logs>
         {chat_log}
-        """
+        </chat_logs>
+        """).strip()
 
         for attempt in range(MAX_RETRY_ATTEMPTS):
             try:
@@ -384,20 +383,21 @@ class GroupSummaryPlugin(Star):
             logger.error(f"群聊总结({VERSION}): 流程崩溃: {traceback.format_exc()}")
             return None
 
-    # ================= 交互入口 (修复参数签名) =================
+    # ================= 交互入口 (终极修复：全兼容参数) =================
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def capture_bot_instance(self, event: AstrMessageEvent, *args, **kwargs):
-        """监听器：使用 *args 吸收多余参数，防止 TypeError"""
+        """监听器"""
         if self._global_bot is None:
             await self._get_bot(event)
 
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
-    async def summarize_group(self, event: AstrMessageEvent, detail=None):
+    async def summarize_group(self, event: AstrMessageEvent, *args, **kwargs):
         """
-        手动指令：使用 detail=None 来接收可能存在的额外参数。
-        这解决了 'TypeError: 3 were given' 和 '必要参数缺失' 的冲突。
+        手动指令
+        FIX: 增加 *args, **kwargs 接收 AstrBot 系统传入的 context/message_chain 等参数
+        这直接解决了 'Missing required parameters' 和 'TypeError'
         """
         bot = await self._get_bot(event)
         if not bot:
@@ -425,8 +425,8 @@ class GroupSummaryPlugin(Star):
             yield event.plain_result("❌ 生成失败")
 
     @filter.llm_tool(name="group_summary_tool")
-    async def call_summary_tool(self, event: AstrMessageEvent, detail=None):
-        """LLM 工具：同样使用 detail=None 兼容参数"""
+    async def call_summary_tool(self, event: AstrMessageEvent, *args, **kwargs):
+        """LLM 工具: 同样增加 *args, **kwargs 兼容性"""
         bot = await self._get_bot(event)
         gid = event.get_group_id()
         if not gid or not bot:
