@@ -3,7 +3,7 @@
 # AstrBot Plugin: Group Summary (Danfong Enhanced Edition)
 
 ![AstrBot Plugin](https://img.shields.io/badge/AstrBot-Plugin-purple)
-![Version](https://img.shields.io/badge/Version-0.1.23-blue)
+![Version](https://img.shields.io/badge/Version-0.1.37-blue)
 ![Python](https://img.shields.io/badge/Python-3.9+-green)
 
 **一个更懂你的 QQ 群聊总结插件**
