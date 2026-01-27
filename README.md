@@ -35,7 +35,8 @@
 
 ## 🖼️ 效果预览
 
-![Uploading 8f5964c42a65a59b3cd1144ae0f3a1a8.jpeg…]()
+![595b52f0c0af9bbd6414bc87860d58c0](https://github.com/user-attachments/assets/44132c56-c7b9-43be-936c-bab0175ef120)
+
 
 
 ## ⚙️ 配置说明
