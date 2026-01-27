@@ -10,7 +10,7 @@ import urllib.parse
 import textwrap
 from pathlib import Path
 from collections import Counter
-from typing import List, Dict, Tuple, Optional, Any, Set
+from typing import List, Dict, Tuple, Optional, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -19,12 +19,13 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
-# --- 全局常量 ---
-VERSION = "0.1.36"
+# --- 版本强制标识 ---
+VERSION = "0.1.37-FixParam"
+
+# 常量
 API_GET_GROUP_MSG_HISTORY = "get_group_msg_history"
 API_GET_GROUP_INFO = "get_group_info"
 API_SEND_GROUP_MSG = "send_group_msg"
-
 MAX_RETRY_ATTEMPTS = 3
 LLM_TIMEOUT = 60
 API_TIMEOUT = 30
@@ -33,37 +34,31 @@ MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
 ESTIMATED_CHARS_PER_TOKEN = 2
 HISTORY_FETCH_BATCH_SIZE = 200
 OVERHEAD_CHARS_PER_MSG = 15
-
 PLATFORM_ONEBOT = ("qq", "onebot", "aiocqhttp", "napcat", "llonebot")
 PLATFORM_UNSUPPORTED = ("telegram", "discord", "wechat")
 
 def _parse_llm_json(text: str) -> dict:
-    """鲁棒性 JSON 解析"""
     text = text.strip()
     text = re.sub(r"^```(json)?", "", text, flags=re.MULTILINE).strip()
     text = re.sub(r"```$", "", text, flags=re.MULTILINE).strip()
-
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-
     try:
-        stack = 0
-        start = -1
+        stack = 0; start = -1
         for i, char in enumerate(text):
             if char == '{':
                 if stack == 0: start = i
                 stack += 1
             elif char == '}':
                 stack -= 1
-                if stack == 0:
-                    return json.loads(text[start:i+1])
+                if stack == 0: return json.loads(text[start:i+1])
     except Exception:
         pass
-    raise ValueError(f"JSON 解析失败，内容片段: {text[:50]}...")
+    raise ValueError(f"JSON解析失败: {text[:50]}...")
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.36")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.37")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -91,6 +86,11 @@ class GroupSummaryPlugin(Star):
         self.template_path = Path(__file__).parent / "templates" / "report.html"
         self.html_template = self._load_template()
 
+        # 打印强制日志证明代码已更新
+        logger.warning(f"==========================================")
+        logger.warning(f"群聊总结插件已加载 - 版本: {VERSION}")
+        logger.warning(f"==========================================")
+
         if self.enable_auto_push:
             self.setup_schedule()
 
@@ -104,8 +104,7 @@ class GroupSummaryPlugin(Star):
             if not self.template_path.exists():
                 return "<h1>Template Missing</h1>"
             return self.template_path.read_text(encoding="utf-8")
-        except Exception as e:
-            logger.error(f"Load Template Error: {e}")
+        except Exception:
             return "<h1>Template Load Error</h1>"
 
     def setup_schedule(self):
@@ -118,11 +117,11 @@ class GroupSummaryPlugin(Star):
                 trigger = CronTrigger(hour=int(hour), minute=int(minute))
                 self.scheduler.add_job(self.run_scheduled_task, trigger)
                 self.scheduler.start()
-                logger.info(f"群聊总结({VERSION}): 定时任务已启动 -> {self.push_time}")
+                logger.info(f"[{VERSION}] 定时任务启动 -> {self.push_time}")
             except ValueError:
-                logger.error(f"群聊总结({VERSION}): 时间格式错误")
+                logger.error(f"[{VERSION}] 时间格式错误")
         except Exception as e:
-            logger.error(f"群聊总结({VERSION}): 调度器启动失败: {e}")
+            logger.error(f"[{VERSION}] 调度器失败: {e}")
 
     def terminate(self):
         try:
@@ -131,7 +130,6 @@ class GroupSummaryPlugin(Star):
         except Exception:
             pass
 
-    # ================= Bot 获取 =================
     async def _get_bot(self, event: Optional[AstrMessageEvent] = None) -> Optional[Any]:
         async with self._bot_lock:
             if event and event.bot:
@@ -143,7 +141,6 @@ class GroupSummaryPlugin(Star):
                 if hasattr(self.context, "get_bots"):
                     bots = self.context.get_bots()
                     if bots:
-                        # 优先找 OneBot
                         for bot in bots.values():
                             p_name = getattr(bot, "platform_name", "").lower()
                             if any(k in p_name for k in PLATFORM_ONEBOT):
@@ -155,7 +152,6 @@ class GroupSummaryPlugin(Star):
                 pass
             return None
 
-    # ================= 渲染兼容层 =================
     async def html_render(self, template: str, data: dict, options: dict = None) -> Optional[str]:
         try:
             if hasattr(self.context, "image_renderer"):
@@ -165,12 +161,8 @@ class GroupSummaryPlugin(Star):
             logger.error(f"Render Error: {e}")
             return None
 
-    # ================= 消息处理流水线 =================
+    # ================= 消息处理 =================
     async def _fetch_messages(self, bot, group_id: str, start_ts: float) -> List[dict]:
-        p_name = getattr(bot, "platform_name", "").lower()
-        if any(k in p_name for k in PLATFORM_UNSUPPORTED):
-            logger.warning(f"Platform {p_name} might not support history fetch")
-
         all_msgs = []
         msg_seq = 0
         last_ids = set()
@@ -178,7 +170,6 @@ class GroupSummaryPlugin(Star):
 
         for _ in range(self.max_query_rounds):
             if len(all_msgs) >= self.max_msg_count: break
-
             try:
                 resp = await asyncio.wait_for(
                     bot.api.call_action(API_GET_GROUP_MSG_HISTORY, 
@@ -186,7 +177,6 @@ class GroupSummaryPlugin(Star):
                         message_seq=msg_seq, reverseOrder=True),
                     timeout=API_TIMEOUT
                 )
-                
                 if not resp or "messages" not in resp: break
                 batch = sorted(resp["messages"], key=lambda x: x.get('time', 0), reverse=True)
                 if not batch: break
@@ -195,8 +185,7 @@ class GroupSummaryPlugin(Star):
                 curr_seq = oldest.get('message_seq')
                 curr_time = oldest.get('time', 0)
                 
-                if curr_seq is None or (last_min_seq is not None and curr_seq >= last_min_seq):
-                    break
+                if curr_seq is None or (last_min_seq is not None and curr_seq >= last_min_seq): break
                 last_min_seq = curr_seq
                 msg_seq = curr_seq
 
@@ -208,12 +197,9 @@ class GroupSummaryPlugin(Star):
                         last_ids.add(mid)
                 
                 if curr_time <= start_ts: break
-                    
             except asyncio.TimeoutError:
                 break
-            except Exception as e:
-                if "ActionFailed" not in str(e):
-                    logger.error(f"Fetch Error: {e}")
+            except Exception:
                 break
         return all_msgs
 
@@ -251,10 +237,7 @@ class GroupSummaryPlugin(Star):
             final_msgs.insert(0, msg) 
             acc_chars += cost
         
-        chat_log = "\n".join([
-            f"[{datetime.datetime.fromtimestamp(m['time']).strftime('%H:%M')}] {m['name']}: {m['content']}"
-            for m in final_msgs
-        ])
+        chat_log = "\n".join([f"[{datetime.datetime.fromtimestamp(m['time']).strftime('%H:%M')}] {m['name']}: {m['content']}" for m in final_msgs])
         return valid_msgs, top_users, dict(trend_stats), chat_log
 
     async def _run_llm(self, chat_log: str) -> Optional[dict]:
@@ -274,22 +257,21 @@ class GroupSummaryPlugin(Star):
         </chat_logs>
         """).strip()
 
-        for attempt in range(MAX_RETRY_ATTEMPTS):
+        for i in range(MAX_RETRY_ATTEMPTS):
             try:
-                if attempt > 0: await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+                if i > 0: await asyncio.sleep(RETRY_BASE_DELAY * (2 ** i))
                 resp = await asyncio.wait_for(provider.text_chat(prompt, session_id=None), timeout=LLM_TIMEOUT)
                 if resp and resp.completion_text:
                     data = _parse_llm_json(resp.completion_text)
                     if isinstance(data, dict): return data
             except Exception as e:
-                logger.error(f"LLM Attempt {attempt+1} Failed: {e}")
+                logger.error(f"[{VERSION}] LLM Attempt {i+1} Failed: {e}")
         return None
 
-    # ================= 主流程 (带错误报告) =================
+    # ================= 流程总控 =================
     async def generate_report(self, bot, group_id: str, silent: bool = False) -> Optional[str]:
         try:
             today_ts = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-            
             try:
                 g_info = await asyncio.wait_for(bot.api.call_action(API_GET_GROUP_INFO, group_id=str(group_id)), timeout=5)
             except:
@@ -297,12 +279,12 @@ class GroupSummaryPlugin(Star):
 
             raw_msgs = await self._fetch_messages(bot, str(group_id), today_ts)
             if not raw_msgs:
-                if not silent: logger.warning(f"No messages for {group_id}")
+                if not silent: logger.warning(f"[{VERSION}] No messages")
                 return None
 
             _, top_users, trend, chat_log = self._process_data(raw_msgs, today_ts)
             if not chat_log:
-                if not silent: logger.warning(f"No valid text for {group_id}")
+                if not silent: logger.warning(f"[{VERSION}] No valid text")
                 return None
 
             analysis = await self._run_llm(chat_log)
@@ -319,30 +301,23 @@ class GroupSummaryPlugin(Star):
                 "bot_name": self.bot_name
             }
             return await self.html_render(self.html_template, render_data, options={"quality": 95, "viewport_width": 500})
-
         except Exception as e:
-            # 这里的 Exception 会被上层捕获，生成详细报告
+            # 捕获异常并向上抛出，以便指令入口生成图片
             raise e
 
-    # ================= 指令入口 (修复参数问题 + 错误报告) =================
-    
+    # ================= 修复指令入口 =================
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
-    async def summarize_group(self, event: AstrMessageEvent, *args, **kwargs):
+    async def summarize_group(self, event: AstrMessageEvent, message: str = ""):
         """
         手动指令：/总结群聊
-        FIX: 使用 *args, **kwargs 接管所有参数，防止 'Missing required parameters'
-        FIX: 增加全链路异常捕获，生成错误报告图片
+        FIX: 使用 message: str = "" 是 AstrBot 最标准的参数写法。
+        解析器看到有默认值，就不会报错参数缺失。
         """
-        # 记录日志，确认进入了函数
-        logger.info(f"群聊总结({VERSION}): 手动触发收到请求: {args}, {kwargs}")
+        logger.info(f"[{VERSION}] 手动触发收到请求")
         
         try:
             bot = await self._get_bot(event)
-            if not bot:
-                yield event.plain_result("❌ 无法获取 Bot 实例")
-                return
-                
             gid = event.get_group_id()
             if not gid:
                 yield event.plain_result("⚠️ 请在群内使用")
@@ -352,7 +327,7 @@ class GroupSummaryPlugin(Star):
             
             lock = self._get_group_lock(str(gid))
             if lock.locked():
-                yield event.plain_result("⚠️ 任务进行中，请勿重复触发")
+                yield event.plain_result("⚠️ 任务进行中...")
                 return
 
             async with lock:
@@ -361,53 +336,41 @@ class GroupSummaryPlugin(Star):
             if img:
                 yield event.image_result(img)
             else:
-                yield event.plain_result("❌ 生成失败，请查看后台日志")
+                yield event.plain_result(f"❌ 生成失败，请检查日志 [{VERSION}]")
 
         except Exception as e:
-            # === 生成详细错误报告 ===
-            err_msg = traceback.format_exc()
-            logger.error(f"群聊总结({VERSION}) 严重错误:\n{err_msg}")
-            yield event.plain_result(f"❌ 插件发生内部错误:\n{e}\n\n(详细日志已记录后台)")
+            err = traceback.format_exc()
+            logger.error(f"[{VERSION}] 手动触发崩溃:\n{err}")
+            # 发送错误详情到群里，方便调试
+            yield event.plain_result(f"❌ 插件内部错误 (v{VERSION}):\n{e}")
 
     @filter.llm_tool(name="group_summary_tool")
-    async def call_summary_tool(self, event: AstrMessageEvent, *args, **kwargs):
+    async def call_summary_tool(self, event: AstrMessageEvent, message: str = ""):
         try:
             bot = await self._get_bot(event)
             gid = event.get_group_id()
-            if not gid or not bot:
-                yield event.plain_result("无法执行")
-                return
+            if not gid: return
 
             yield event.plain_result(f"🌱 正在分析...")
             async with self._get_group_lock(str(gid)):
                 img = await self.generate_report(bot, gid, silent=False)
-                
-            if img:
-                yield event.image_result(img)
-            else:
-                yield event.plain_result("失败")
+            if img: yield event.image_result(img)
         except Exception as e:
-            logger.error(f"Tool Error: {traceback.format_exc()}")
-            yield event.plain_result(f"执行出错: {e}")
+            logger.error(f"Tool Error: {e}")
 
     # ================= 定时任务 =================
     async def run_scheduled_task(self):
         try:
-            logger.info(f"群聊总结({VERSION}): 定时任务触发")
+            logger.info(f"[{VERSION}] 定时任务触发")
             bot = await self._get_bot()
-            if not bot:
-                logger.warning("无可用 Bot")
-                return
-
-            if not self.push_groups: return
+            if not bot or not self.push_groups: return
 
             tasks = []
             for gid in self.push_groups:
                 tasks.append(self._push_single_group(bot, str(gid)))
             await asyncio.gather(*tasks)
-
-        except Exception as e:
-            logger.error(f"群聊总结({VERSION}): 定时任务崩溃: {traceback.format_exc()}")
+        except Exception:
+            pass
 
     async def _push_single_group(self, bot, gid: str):
         async with self._push_semaphore:
@@ -416,28 +379,23 @@ class GroupSummaryPlugin(Star):
 
             async with lock:
                 try:
-                    logger.info(f"Processing {gid}")
                     img = await self.generate_report(bot, gid, silent=True)
-                    
                     if img:
                         cq = self._prepare_cq_code(img)
                         if cq:
                             await bot.api.call_action(API_SEND_GROUP_MSG, group_id=int(gid), message=cq)
-                            logger.info(f"Push success {gid}")
+                            logger.info(f"[{VERSION}] {gid} 推送成功")
                 except Exception as e:
-                    logger.error(f"Push failed {gid}: {e}")
-                
+                    logger.error(f"[{VERSION}] {gid} 推送失败: {e}")
                 await asyncio.sleep(PUSH_DELAY_BETWEEN_GROUPS)
 
     def _prepare_cq_code(self, img_path: str) -> Optional[str]:
         if img_path.startswith("http"):
             return f"[CQ:image,file={img_path}]"
-        
         try:
             path_obj = Path(urllib.parse.urlparse(img_path).path).resolve()
             if not path_obj.exists(): return None
             if path_obj.stat().st_size > MAX_IMAGE_SIZE_BYTES: return None
-
             with open(path_obj, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode('utf-8')
             return f"[CQ:image,file=base64://{b64}]"
