@@ -27,7 +27,7 @@ def _parse_llm_json(text: str) -> dict:
         except: pass
     return {}
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.43")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.44")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -80,29 +80,44 @@ class GroupSummaryPlugin(Star):
     async def summarize_group(self, event: AstrMessageEvent):
         if not self.global_bot: self.global_bot = event.bot
         group_id = event.get_group_id()
-        if not group_id: return yield event.plain_result("请在群聊使用")
+        
+        # --- 修复点 1: 拆分 yield 和 return ---
+        if not group_id: 
+            yield event.plain_result("请在群聊使用")
+            return
         
         yield event.plain_result("🌱 正在连接神经云端，回溯今日记忆...")
         img = await self.generate_report(event.bot, group_id)
-        yield event.image_result(img) if img else event.plain_result("❌ 生成失败，请检查日志")
+        
+        if img:
+            yield event.image_result(img)
+        else:
+            yield event.plain_result("❌ 生成失败，请检查日志")
 
     @filter.llm_tool(name="group_summary_tool")
     async def call_summary_tool(self, event: AstrMessageEvent):
         if not self.global_bot: self.global_bot = event.bot
         group_id = event.get_group_id()
-        if not group_id: return yield event.plain_result("仅限群聊")
+        
+        # --- 修复点 2: 拆分 yield 和 return ---
+        if not group_id: 
+            yield event.plain_result("仅限群聊")
+            return
         
         yield event.plain_result("🌱 正在分析...")
         img = await self.generate_report(event.bot, group_id)
-        yield event.image_result(img) if img else event.plain_result("生成失败")
+        
+        if img:
+            yield event.image_result(img)
+        else:
+            yield event.plain_result("生成失败")
 
-    # 定时任务逻辑 (保留你的增强功能)
+    # 定时任务逻辑
     async def run_scheduled_task(self):
         if not self.global_bot or not self.push_groups: return
         for gid in self.push_groups:
             img = await self.generate_report(self.global_bot, str(gid), silent=True)
             if img:
-                # 兼容不同系统的文件路径处理
                 if not img.startswith("http"):
                     path = img.replace("file://", "")
                     if os.name=='nt' and path.startswith('/') and ':' in path: path = path[1:]
@@ -111,7 +126,7 @@ class GroupSummaryPlugin(Star):
                     await self.global_bot.api.call_action("send_group_msg", group_id=int(gid), message=f"[CQ:image,file=base64://{b64}]")
             await asyncio.sleep(5)
 
-    # 数据获取 (保持原逻辑)
+    # 数据获取
     async def get_data(self, bot, group_id):
         now = datetime.datetime.now()
         start = now.replace(hour=0, minute=0, second=0).timestamp()
@@ -125,11 +140,10 @@ class GroupSummaryPlugin(Star):
                 batch = ret.get("messages", [])
                 if not batch: break
                 
-                # 关键修复：确保时间顺序处理正确
                 oldest = batch[-1].get("time", 0)
                 newest = batch[0].get("time", 0)
                 seq = batch[-1]["message_seq"]
-                if oldest > newest: # 兼容某些实现的倒序返回
+                if oldest > newest:
                     seq = batch[0]["message_seq"]
                     oldest = newest
                 
@@ -137,7 +151,6 @@ class GroupSummaryPlugin(Star):
                 if oldest < start: break
             except: break
         
-        # 数据清洗
         valid = []
         users = Counter()
         trend = Counter()
@@ -165,14 +178,11 @@ class GroupSummaryPlugin(Star):
         if not res or not res[0]: return None
         valid_msgs, top_users, trend, chat_log = res
         
-        # 截断日志
         if len(chat_log) > self.msg_token_limit: chat_log = chat_log[-self.msg_token_limit:]
 
-        # 构建 Prompt
         style = self.summary_prompt_style.replace("{bot_name}", self.bot_name) or f"{self.bot_name}的温暖总结"
         prompt = f"分析以下群聊(日期{datetime.date.today()})。\n要求：3-5个话题(时间+内容)，一段{style}。\n格式JSON：{{\"topics\":[{{\"time_range\":\"\",\"summary\":\"\"}}],\"closing_remark\":\"\"}}\n记录：\n{chat_log}"
         
-        # LLM 请求
         data = {}
         prov = self.context.get_provider_by_id(self.config.get("provider_id")) or self.context.get_using_provider()
         if prov:
@@ -184,7 +194,6 @@ class GroupSummaryPlugin(Star):
         
         if not data: data = {"topics": [], "closing_remark": "分析失败，请检查模型连接。"}
 
-        # 渲染 (关键修复点)
         render_data = {
             "date": datetime.datetime.now().strftime("%Y.%m.%d"),
             "top_users": top_users,
@@ -195,8 +204,7 @@ class GroupSummaryPlugin(Star):
             "bot_name": self.bot_name
         }
         
-        # --- 重点：这里修复了导致报错的参数 ---
-        # 移除了 "ultra"，改为标准的 viewport 和 scale 参数
+        # --- 针对 400 错误的修复参数 ---
         options = {
             "viewport": {"width": 500, "height": 1500},
             "device_scale_factor": 2
