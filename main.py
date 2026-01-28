@@ -2,19 +2,18 @@ import json
 import os
 import re
 import datetime
+import time
 import traceback
 import asyncio
-import base64
+import jinja2
 from collections import Counter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-import jinja2
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
-# 极简 JSON 解析器
 def _parse_llm_json(text: str) -> dict:
     text = text.strip()
     if "```" in text:
@@ -28,7 +27,7 @@ def _parse_llm_json(text: str) -> dict:
         except: pass
     return {}
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.47")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.48")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -55,24 +54,23 @@ class GroupSummaryPlugin(Star):
         except:
             self.html_template = "<h1>Template Not Found</h1>"
             
-        # 检测环境
+        # 依赖检测日志
         try:
             import playwright
-            from playwright.async_api import async_playwright
-            logger.info("群聊总结(增强版): 本地渲染依赖已就绪 (Playwright)。")
+            logger.info("群聊总结(增强版): 依赖环境检测正常。")
         except:
-            logger.error("群聊总结(增强版): 严重警告！未检测到 playwright，请务必在容器内执行 `playwright install chromium --with-deps`")
+            logger.error("群聊总结(增强版): ⚠️ 未检测到 Playwright，请确保已执行安装命令。")
 
         # 定时任务
         self.scheduler = AsyncIOScheduler()
         if self.enable_auto_push:
             self.setup_schedule()
 
-    # --- 核心：手写一个强制本地渲染的方法，绕过 AstrBot 核心 ---
+    # --- 核心修改：保存为本地文件，避免 Base64 报错 ---
     async def render_locally(self, html_template: str, data: dict):
         from playwright.async_api import async_playwright
         
-        # 1. 手动渲染 Jinja2 模板
+        # 1. 渲染 HTML
         try:
             template = jinja2.Template(html_template)
             html_content = template.render(**data)
@@ -80,31 +78,31 @@ class GroupSummaryPlugin(Star):
             logger.error(f"模板渲染失败: {e}")
             return None
 
-        # 2. 启动浏览器 (关键：--no-sandbox)
+        # 2. 启动浏览器生成图片
         async with async_playwright() as p:
             try:
-                # Docker 环境必须加这两个参数，否则启动失败
+                # 启动参数适配 Docker
                 browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
                 page = await browser.new_page(
-                    viewport={"width": 500, "height": 2000}, # 初始高度给大点，后面截图会自动裁切
+                    viewport={"width": 500, "height": 2000},
                     device_scale_factor=2
                 )
                 
                 await page.set_content(html_content)
-                # 等待内容加载
                 await page.wait_for_load_state("networkidle")
                 
-                # 截图 (full_page=True 会自动截取完整长度)
-                img_bytes = await page.screenshot(type="jpeg", quality=90, full_page=True)
+                # --- 修改点：保存为临时文件 ---
+                plugin_dir = os.path.dirname(os.path.abspath(__file__))
+                temp_filename = f"summary_temp_{int(time.time())}.jpg"
+                save_path = os.path.join(plugin_dir, temp_filename)
                 
+                await page.screenshot(path=save_path, type="jpeg", quality=90, full_page=True)
                 await browser.close()
                 
-                # 转 Base64
-                b64 = base64.b64encode(img_bytes).decode()
-                return f"base64://{b64}"
+                return save_path # 返回文件路径，而不是 Base64 字符串
                 
             except Exception as e:
-                logger.error(f"Playwright 浏览器启动或截图失败: {e}")
+                logger.error(f"本地渲染失败: {e}")
                 return None
 
     def setup_schedule(self):
@@ -133,12 +131,15 @@ class GroupSummaryPlugin(Star):
             return
         
         yield event.plain_result("🌱 正在连接神经云端，回溯今日记忆...")
-        img_url = await self.generate_report(event.bot, group_id)
+        img_path = await self.generate_report(event.bot, group_id)
         
-        if img_url:
-            yield event.image_result(img_url) # image_result 支持 base64:// 开头的字符串
+        if img_path and os.path.exists(img_path):
+            yield event.image_result(img_path)
+            # 发送后清理临时文件
+            try: os.remove(img_path)
+            except: pass
         else:
-            yield event.plain_result("❌ 生成失败，浏览器启动异常，请检查日志。")
+            yield event.plain_result("❌ 生成失败，请检查后台日志。")
 
     @filter.llm_tool(name="group_summary_tool")
     async def call_summary_tool(self, event: AstrMessageEvent):
@@ -150,19 +151,26 @@ class GroupSummaryPlugin(Star):
             return
         
         yield event.plain_result("🌱 正在分析...")
-        img_url = await self.generate_report(event.bot, group_id)
+        img_path = await self.generate_report(event.bot, group_id)
         
-        if img_url:
-            yield event.image_result(img_url)
+        if img_path and os.path.exists(img_path):
+            yield event.image_result(img_path)
+            try: os.remove(img_path)
+            except: pass
         else:
             yield event.plain_result("生成失败")
 
     async def run_scheduled_task(self):
         if not self.global_bot or not self.push_groups: return
         for gid in self.push_groups:
-            img_url = await self.generate_report(self.global_bot, str(gid), silent=True)
-            if img_url:
-                await self.global_bot.api.call_action("send_group_msg", group_id=int(gid), message=f"[CQ:image,file={img_url}]")
+            img_path = await self.generate_report(self.global_bot, str(gid), silent=True)
+            if img_path and os.path.exists(img_path):
+                # 定时任务使用 CQ 码发送本地文件
+                await self.global_bot.api.call_action("send_group_msg", group_id=int(gid), message=f"[CQ:image,file=file://{img_path}]")
+                try: 
+                    await asyncio.sleep(2) # 等待发送完成再删除
+                    os.remove(img_path)
+                except: pass
             await asyncio.sleep(5)
 
     async def get_data(self, bot, group_id):
@@ -242,5 +250,4 @@ class GroupSummaryPlugin(Star):
             "bot_name": self.bot_name
         }
         
-        # --- 终极修改：直接调用我们自己写的本地渲染函数，不走 AstrBot 核心了 ---
         return await self.render_locally(self.html_template, render_data)
