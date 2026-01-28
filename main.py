@@ -33,7 +33,7 @@ def _parse_llm_json(text: str) -> dict:
         pass
     raise ValueError(f"无法提取有效 JSON，原始文本: {text[:50]}...")
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.29")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.41")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -60,7 +60,7 @@ class GroupSummaryPlugin(Star):
         try:
             with open(template_path, "r", encoding="utf-8") as f:
                 self.html_template = f.read()
-            logger.info(f"群聊总结(增强版): 模板加载成功 | v0.1.29 Stable")
+            logger.info(f"群聊总结(增强版): 模板加载成功 | v0.1.41 Stable")
         except FileNotFoundError:
             logger.error(f"群聊总结(增强版): 模板文件丢失: {template_path}")
             self.html_template = "<h1>Template Not Found</h1>"
@@ -95,13 +95,13 @@ class GroupSummaryPlugin(Star):
 
     # ================= 指令与事件监听 =================
 
-    # 1. 自动捕获 Bot (保留 *args 以防万一)
+    # 1. 自动捕获 Bot
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def capture_bot_instance(self, event: AstrMessageEvent, *args, **kwargs):
         if self.global_bot is None:
             self.global_bot = event.bot
 
-    # 2. 手动指令 (关键修复：移除了重复的 event_message_type 装饰器)
+    # 2. 手动指令
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def summarize_group(self, event: AstrMessageEvent):
@@ -365,7 +365,16 @@ class GroupSummaryPlugin(Star):
                 "group_name": group_info.get("group_name", "群聊"),
                 "bot_name": self.bot_name
             }
-            options = {"quality": 95, "device_scale_factor_level": "ultra", "viewport_width": 500}
+            
+            # 【重要修复】options 参数调整
+            # 1. 移除了 "device_scale_factor_level": "ultra"，因为远程接口(soulter.top)不支持此参数会导致 400 错误
+            # 2. 更改为标准的 viewport 字典格式
+            # 3. 强烈建议在环境安装 playwright 以获得本地渲染能力
+            options = {
+                "quality": 95,
+                "viewport": {"width": 500, "height": 2000},
+                "device_scale_factor": 2 # 设为数字更安全
+            }
             return await self.html_render(self.html_template, render_data, options=options)
         except Exception as e:
             logger.error(f"Render Error: {e}")
