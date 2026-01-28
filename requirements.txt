@@ -1,3 +1,4 @@
 jinja2
 apscheduler
 brotli
+playwright
