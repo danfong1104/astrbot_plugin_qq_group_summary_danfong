@@ -6,6 +6,7 @@ import time
 import traceback
 import asyncio
 import jinja2
+import base64
 from collections import Counter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -27,7 +28,7 @@ def _parse_llm_json(text: str) -> dict:
         except: pass
     return {}
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.48")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.49")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -54,7 +55,7 @@ class GroupSummaryPlugin(Star):
         except:
             self.html_template = "<h1>Template Not Found</h1>"
             
-        # 依赖检测日志
+        # 依赖检测
         try:
             import playwright
             logger.info("群聊总结(增强版): 依赖环境检测正常。")
@@ -66,11 +67,10 @@ class GroupSummaryPlugin(Star):
         if self.enable_auto_push:
             self.setup_schedule()
 
-    # --- 核心修改：保存为本地文件，避免 Base64 报错 ---
+    # --- 核心修改1：精准截图，解决留白问题 ---
     async def render_locally(self, html_template: str, data: dict):
         from playwright.async_api import async_playwright
         
-        # 1. 渲染 HTML
         try:
             template = jinja2.Template(html_template)
             html_content = template.render(**data)
@@ -78,28 +78,31 @@ class GroupSummaryPlugin(Star):
             logger.error(f"模板渲染失败: {e}")
             return None
 
-        # 2. 启动浏览器生成图片
         async with async_playwright() as p:
             try:
-                # 启动参数适配 Docker
                 browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
                 page = await browser.new_page(
-                    viewport={"width": 500, "height": 2000},
+                    viewport={"width": 500, "height": 2000}, # 初始画布给大点无所谓
                     device_scale_factor=2
                 )
                 
                 await page.set_content(html_content)
                 await page.wait_for_load_state("networkidle")
                 
-                # --- 修改点：保存为临时文件 ---
+                # --- 修复点：只截取 .container 元素 ---
+                # 这样图片高度就会自动适应内容，不会多出一像素空白
+                locator = page.locator(".container")
+                
+                # 临时文件路径
                 plugin_dir = os.path.dirname(os.path.abspath(__file__))
                 temp_filename = f"summary_temp_{int(time.time())}.jpg"
                 save_path = os.path.join(plugin_dir, temp_filename)
                 
-                await page.screenshot(path=save_path, type="jpeg", quality=90, full_page=True)
+                # 对定位到的元素截图
+                await locator.screenshot(path=save_path, type="jpeg", quality=90)
                 await browser.close()
                 
-                return save_path # 返回文件路径，而不是 Base64 字符串
+                return save_path
                 
             except Exception as e:
                 logger.error(f"本地渲染失败: {e}")
@@ -135,7 +138,8 @@ class GroupSummaryPlugin(Star):
         
         if img_path and os.path.exists(img_path):
             yield event.image_result(img_path)
-            # 发送后清理临时文件
+            # 这里的清理稍微延后一点点，防止文件还在占用
+            await asyncio.sleep(1)
             try: os.remove(img_path)
             except: pass
         else:
@@ -155,22 +159,42 @@ class GroupSummaryPlugin(Star):
         
         if img_path and os.path.exists(img_path):
             yield event.image_result(img_path)
+            await asyncio.sleep(1)
             try: os.remove(img_path)
             except: pass
         else:
             yield event.plain_result("生成失败")
 
+    # --- 核心修改2：修复定时任务发送逻辑 ---
     async def run_scheduled_task(self):
         if not self.global_bot or not self.push_groups: return
+        
+        logger.info(f"群聊总结(增强版): 开始执行定时推送，目标群: {self.push_groups}")
+        
         for gid in self.push_groups:
             img_path = await self.generate_report(self.global_bot, str(gid), silent=True)
             if img_path and os.path.exists(img_path):
-                # 定时任务使用 CQ 码发送本地文件
-                await self.global_bot.api.call_action("send_group_msg", group_id=int(gid), message=f"[CQ:image,file=file://{img_path}]")
-                try: 
-                    await asyncio.sleep(2) # 等待发送完成再删除
-                    os.remove(img_path)
+                try:
+                    # 读取图片转 Base64，彻底解决 Docker 路径不通的问题
+                    with open(img_path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                    
+                    # 使用 base64 协议发送
+                    await self.global_bot.api.call_action(
+                        "send_group_msg", 
+                        group_id=int(gid), 
+                        message=f"[CQ:image,file=base64://{b64}]"
+                    )
+                    logger.info(f"群聊总结(增强版): 群 {gid} 推送成功")
+                except Exception as e:
+                    logger.error(f"群聊总结(增强版): 群 {gid} 发送失败: {e}")
+                
+                # 清理临时文件
+                try: os.remove(img_path)
                 except: pass
+            else:
+                logger.warning(f"群聊总结(增强版): 群 {gid} 生成图片失败或无内容")
+                
             await asyncio.sleep(5)
 
     async def get_data(self, bot, group_id):
