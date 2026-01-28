@@ -329,6 +329,11 @@ class GroupSummaryPlugin(Star):
                 continue
             
             raw = m.get("raw_message", "")
+            
+            # --- 修复：过滤掉指令本身，防止被总结进去 ---
+            if raw.strip().startswith(("/总结群聊", "总结群聊", "/测试推送")):
+                continue
+
             sender = m.get("sender", {})
             user_id = str(sender.get("user_id", ""))
             nick = sender.get("card") or sender.get("nickname") or "用户"
@@ -375,20 +380,27 @@ class GroupSummaryPlugin(Star):
         if len(chat_log) > self.msg_token_limit:
             chat_log = chat_log[-self.msg_token_limit:]
 
-        # 处理人设 Prompt
         style = self.summary_prompt_style.replace("{bot_name}", self.bot_name)
         if not style:
             style = f"{self.bot_name}的温暖总结，对今天群里的氛围进行点评"
 
-        # --- Prompt 优化核心 ---
-        # 1. 明确任务目标
-        # 2. 将 style 强绑定到 closing_remark 字段
+        # --- Prompt 结构优化 ---
+        # 1. 明确角色设定 (Role Setting)
+        # 2. 明确任务目标 (Task)
+        # 3. 将样式要求移至“角色设定”区，避免混淆指令
         prompt = textwrap.dedent(f"""
             你是一个群聊记录员“{self.bot_name}”。请根据以下的群聊记录（日期：{datetime.datetime.now().strftime('%Y-%m-%d')}），生成一份总结数据。
             
+            【角色与风格设定】：
+            请完全沉浸在以下人设中进行回复，不要暴露你是AI。
+            设定如下：
+            >>>
+            {style}
+            <<<
+            
             【任务目标】：
             1. 话题分析：提取 3-8 个主要话题，每个话题包含：时间段（如 10:00 ~ 11:00）和简短内容。
-            2. 群聊点评：{style}（请务必将这段点评内容填入 JSON 的 closing_remark 字段中）
+            2. 群聊点评（closing_remark）：请务必**使用上述【角色与风格设定】中的语气、口癖和性格**，对今天的群聊内容进行一段总结点评。
             
             【输出格式】：
             请严格返回纯 JSON 格式，不要包含 Markdown 代码块标记：
@@ -396,7 +408,7 @@ class GroupSummaryPlugin(Star):
                 "topics": [
                     {{"time_range": "10:00 ~ 10:30", "summary": "话题内容..."}}
                 ],
-                "closing_remark": "这里填写符合上述点评风格要求的群聊总结..."
+                "closing_remark": "这里填写符合人设的群聊点评..."
             }}
             
             【聊天记录】：
