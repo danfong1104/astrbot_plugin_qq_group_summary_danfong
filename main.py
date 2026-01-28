@@ -28,7 +28,7 @@ def _parse_llm_json(text: str) -> dict:
         except: pass
     return {}
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.49")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.50")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -67,7 +67,28 @@ class GroupSummaryPlugin(Star):
         if self.enable_auto_push:
             self.setup_schedule()
 
-    # --- 核心修改1：精准截图，解决留白问题 ---
+    # --- 调试增强：详细打印时间信息 ---
+    def setup_schedule(self):
+        try:
+            if self.scheduler.running: self.scheduler.shutdown()
+            self.scheduler = AsyncIOScheduler()
+            hour, minute = self.push_time.split(":")
+            trigger = CronTrigger(hour=int(hour), minute=int(minute))
+            
+            # 添加任务
+            self.scheduler.add_job(self.run_scheduled_task, trigger)
+            self.scheduler.start()
+            
+            # 打印调试信息
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            logger.info(f"群聊总结(增强版): 定时任务已启动。")
+            logger.info(f" -> 设定推送时间: {self.push_time}")
+            logger.info(f" -> 当前系统时间: {now_str} (如果此时间与你的手表不符，说明容器时区不是 UTC+8，推送会不准)")
+            
+        except Exception as e:
+            logger.error(f"群聊总结: 定时任务启动失败 {e}")
+
+    # --- 本地渲染 ---
     async def render_locally(self, html_template: str, data: dict):
         from playwright.async_api import async_playwright
         
@@ -82,46 +103,32 @@ class GroupSummaryPlugin(Star):
             try:
                 browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
                 page = await browser.new_page(
-                    viewport={"width": 500, "height": 2000}, # 初始画布给大点无所谓
+                    viewport={"width": 500, "height": 2000},
                     device_scale_factor=2
                 )
                 
                 await page.set_content(html_content)
                 await page.wait_for_load_state("networkidle")
                 
-                # --- 修复点：只截取 .container 元素 ---
-                # 这样图片高度就会自动适应内容，不会多出一像素空白
                 locator = page.locator(".container")
                 
-                # 临时文件路径
                 plugin_dir = os.path.dirname(os.path.abspath(__file__))
                 temp_filename = f"summary_temp_{int(time.time())}.jpg"
                 save_path = os.path.join(plugin_dir, temp_filename)
                 
-                # 对定位到的元素截图
                 await locator.screenshot(path=save_path, type="jpeg", quality=90)
                 await browser.close()
-                
                 return save_path
                 
             except Exception as e:
                 logger.error(f"本地渲染失败: {e}")
                 return None
 
-    def setup_schedule(self):
-        try:
-            if self.scheduler.running: self.scheduler.shutdown()
-            self.scheduler = AsyncIOScheduler()
-            hour, minute = self.push_time.split(":")
-            trigger = CronTrigger(hour=int(hour), minute=int(minute))
-            self.scheduler.add_job(self.run_scheduled_task, trigger)
-            self.scheduler.start()
-        except Exception as e:
-            logger.error(f"群聊总结: 定时任务错误 {e}")
-
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def capture_bot(self, event: AstrMessageEvent):
-        if not self.global_bot: self.global_bot = event.bot
+        if not self.global_bot: 
+            self.global_bot = event.bot
+            logger.info(f"群聊总结(增强版): 已捕获 Bot 实例，定时推送功能就绪。")
 
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -138,12 +145,21 @@ class GroupSummaryPlugin(Star):
         
         if img_path and os.path.exists(img_path):
             yield event.image_result(img_path)
-            # 这里的清理稍微延后一点点，防止文件还在占用
             await asyncio.sleep(1)
             try: os.remove(img_path)
             except: pass
         else:
             yield event.plain_result("❌ 生成失败，请检查后台日志。")
+
+    # --- 新增指令：手动测试推送逻辑 ---
+    @filter.command("测试推送")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def test_push(self, event: AstrMessageEvent):
+        """手动触发一次推送流程，用于测试配置"""
+        if not self.global_bot: self.global_bot = event.bot
+        yield event.plain_result("🚀 正在手动触发推送任务...")
+        await self.run_scheduled_task()
+        yield event.plain_result("✅ 推送任务执行完毕，请检查群消息。")
 
     @filter.llm_tool(name="group_summary_tool")
     async def call_summary_tool(self, event: AstrMessageEvent):
@@ -165,35 +181,42 @@ class GroupSummaryPlugin(Star):
         else:
             yield event.plain_result("生成失败")
 
-    # --- 核心修改2：修复定时任务发送逻辑 ---
+    # --- 调试增强：详细的失败日志 ---
     async def run_scheduled_task(self):
-        if not self.global_bot or not self.push_groups: return
+        logger.info("⏳ 定时器触发！准备执行推送...")
+
+        if not self.global_bot:
+            logger.error("❌ 定时推送失败：未获取到 Bot 实例。")
+            logger.error("💡 解决方法：请Bot启动后，在任意群里随便发一条消息，激活插件。")
+            return
+
+        if not self.push_groups:
+            logger.warning("⚠️ 定时推送跳过：配置项 `push_groups` 为空。")
+            return
         
-        logger.info(f"群聊总结(增强版): 开始执行定时推送，目标群: {self.push_groups}")
+        logger.info(f"🎯 目标群列表: {self.push_groups}")
         
         for gid in self.push_groups:
+            logger.info(f"正在处理群 {gid} ...")
             img_path = await self.generate_report(self.global_bot, str(gid), silent=True)
             if img_path and os.path.exists(img_path):
                 try:
-                    # 读取图片转 Base64，彻底解决 Docker 路径不通的问题
                     with open(img_path, "rb") as f:
                         b64 = base64.b64encode(f.read()).decode()
                     
-                    # 使用 base64 协议发送
                     await self.global_bot.api.call_action(
                         "send_group_msg", 
                         group_id=int(gid), 
                         message=f"[CQ:image,file=base64://{b64}]"
                     )
-                    logger.info(f"群聊总结(增强版): 群 {gid} 推送成功")
+                    logger.info(f"✅ 群 {gid} 推送成功")
                 except Exception as e:
-                    logger.error(f"群聊总结(增强版): 群 {gid} 发送失败: {e}")
+                    logger.error(f"❌ 群 {gid} 发送失败: {e}")
                 
-                # 清理临时文件
                 try: os.remove(img_path)
                 except: pass
             else:
-                logger.warning(f"群聊总结(增强版): 群 {gid} 生成图片失败或无内容")
+                logger.warning(f"❌ 群 {gid} 图片生成失败")
                 
             await asyncio.sleep(5)
 
