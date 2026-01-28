@@ -27,7 +27,7 @@ def _parse_llm_json(text: str) -> dict:
         except: pass
     return {}
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.44")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.45")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -81,7 +81,6 @@ class GroupSummaryPlugin(Star):
         if not self.global_bot: self.global_bot = event.bot
         group_id = event.get_group_id()
         
-        # --- 修复点 1: 拆分 yield 和 return ---
         if not group_id: 
             yield event.plain_result("请在群聊使用")
             return
@@ -99,7 +98,6 @@ class GroupSummaryPlugin(Star):
         if not self.global_bot: self.global_bot = event.bot
         group_id = event.get_group_id()
         
-        # --- 修复点 2: 拆分 yield 和 return ---
         if not group_id: 
             yield event.plain_result("仅限群聊")
             return
@@ -204,10 +202,21 @@ class GroupSummaryPlugin(Star):
             "bot_name": self.bot_name
         }
         
-        # --- 针对 400 错误的修复参数 ---
+        # --- 策略：带参数渲染 ---
+        # 只保留基本的 viewport，移除 scale 等易报错参数
         options = {
-            "viewport": {"width": 500, "height": 1500},
-            "device_scale_factor": 2
+            "viewport": {"width": 500, "height": 2000}
         }
         
-        return await self.html_render(self.html_template, render_data, options=options)
+        try:
+            return await self.html_render(self.html_template, render_data, options=options)
+        except Exception as e:
+            logger.warning(f"第一次渲染失败 (Options模式): {e}。尝试无参兜底模式...")
+            
+            # --- 策略：兜底重试 ---
+            # 如果上面依然报 400，说明远程服务器完全不接受 options，这里尝试裸奔
+            try:
+                return await self.html_render(self.html_template, render_data)
+            except Exception as final_e:
+                logger.error(f"最终渲染失败: {final_e}")
+                return None
