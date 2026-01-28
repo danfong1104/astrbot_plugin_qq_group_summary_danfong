@@ -28,13 +28,13 @@ def _parse_llm_json(text: str) -> dict:
         except: pass
     return {}
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.50")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.52")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
         
-        # 配置读取
+        # 基础配置
         self.max_msg_count = self.config.get("max_msg_count", 2000)
         self.max_query_rounds = self.config.get("max_query_rounds", 10)
         self.bot_name = self.config.get("bot_name", "BOT")
@@ -44,6 +44,27 @@ class GroupSummaryPlugin(Star):
         self.push_time = self.config.get("push_time", "23:00")
         self.push_groups = self.config.get("push_groups", [])
         self.summary_prompt_style = self.config.get("summary_prompt_style", "")
+        
+        # --- 名称映射配置 (增强容错性) ---
+        self.enable_name_mapping = self.config.get("enable_name_mapping", False)
+        raw_mapping_list = self.config.get("name_mapping", [])
+        self.name_map = {}
+        
+        if raw_mapping_list:
+            for item in raw_mapping_list:
+                # 1. 转字符串并去首尾空格
+                item = str(item).strip()
+                # 2. 核心修改：将中文冒号替换为英文冒号
+                item = item.replace("：", ":")
+                
+                if ":" in item:
+                    parts = item.split(":", 1)
+                    qq_id = parts[0].strip()
+                    new_name = parts[1].strip()
+                    if qq_id and new_name:
+                        self.name_map[qq_id] = new_name
+            logger.info(f"群聊总结(增强版): 已加载 {len(self.name_map)} 个昵称映射规则。")
+
         self.global_bot = None
 
         # 模板加载
@@ -67,23 +88,29 @@ class GroupSummaryPlugin(Star):
         if self.enable_auto_push:
             self.setup_schedule()
 
-    # --- 调试增强：详细打印时间信息 ---
     def setup_schedule(self):
         try:
             if self.scheduler.running: self.scheduler.shutdown()
             self.scheduler = AsyncIOScheduler()
-            hour, minute = self.push_time.split(":")
-            trigger = CronTrigger(hour=int(hour), minute=int(minute))
             
-            # 添加任务
+            # --- 时间解析 (增强容错性) ---
+            # 1. 替换中文冒号
+            time_str = str(self.push_time).replace("：", ":").strip()
+            
+            # 2. 安全拆分
+            try:
+                hour, minute = time_str.split(":")
+                hour, minute = int(hour), int(minute)
+            except ValueError:
+                logger.error(f"群聊总结(增强版): 推送时间格式错误 [{self.push_time}]，请使用 HH:MM 格式（如 23:00）")
+                return
+
+            trigger = CronTrigger(hour=hour, minute=minute)
             self.scheduler.add_job(self.run_scheduled_task, trigger)
             self.scheduler.start()
             
-            # 打印调试信息
             now_str = datetime.datetime.now().strftime("%H:%M:%S")
-            logger.info(f"群聊总结(增强版): 定时任务已启动。")
-            logger.info(f" -> 设定推送时间: {self.push_time}")
-            logger.info(f" -> 当前系统时间: {now_str} (如果此时间与你的手表不符，说明容器时区不是 UTC+8，推送会不准)")
+            logger.info(f"群聊总结(增强版): 定时任务已启动 -> {time_str} (系统时间: {now_str})")
             
         except Exception as e:
             logger.error(f"群聊总结: 定时任务启动失败 {e}")
@@ -128,7 +155,7 @@ class GroupSummaryPlugin(Star):
     async def capture_bot(self, event: AstrMessageEvent):
         if not self.global_bot: 
             self.global_bot = event.bot
-            logger.info(f"群聊总结(增强版): 已捕获 Bot 实例，定时推送功能就绪。")
+            logger.info(f"群聊总结(增强版): 已捕获 Bot 实例。")
 
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -151,15 +178,13 @@ class GroupSummaryPlugin(Star):
         else:
             yield event.plain_result("❌ 生成失败，请检查后台日志。")
 
-    # --- 新增指令：手动测试推送逻辑 ---
     @filter.command("测试推送")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def test_push(self, event: AstrMessageEvent):
-        """手动触发一次推送流程，用于测试配置"""
         if not self.global_bot: self.global_bot = event.bot
         yield event.plain_result("🚀 正在手动触发推送任务...")
         await self.run_scheduled_task()
-        yield event.plain_result("✅ 推送任务执行完毕，请检查群消息。")
+        yield event.plain_result("✅ 推送任务执行完毕。")
 
     @filter.llm_tool(name="group_summary_tool")
     async def call_summary_tool(self, event: AstrMessageEvent):
@@ -181,23 +206,11 @@ class GroupSummaryPlugin(Star):
         else:
             yield event.plain_result("生成失败")
 
-    # --- 调试增强：详细的失败日志 ---
     async def run_scheduled_task(self):
-        logger.info("⏳ 定时器触发！准备执行推送...")
-
-        if not self.global_bot:
-            logger.error("❌ 定时推送失败：未获取到 Bot 实例。")
-            logger.error("💡 解决方法：请Bot启动后，在任意群里随便发一条消息，激活插件。")
-            return
-
-        if not self.push_groups:
-            logger.warning("⚠️ 定时推送跳过：配置项 `push_groups` 为空。")
-            return
-        
-        logger.info(f"🎯 目标群列表: {self.push_groups}")
+        if not self.global_bot or not self.push_groups: return
+        logger.info("⏳ 定时器触发，开始推送...")
         
         for gid in self.push_groups:
-            logger.info(f"正在处理群 {gid} ...")
             img_path = await self.generate_report(self.global_bot, str(gid), silent=True)
             if img_path and os.path.exists(img_path):
                 try:
@@ -215,9 +228,6 @@ class GroupSummaryPlugin(Star):
                 
                 try: os.remove(img_path)
                 except: pass
-            else:
-                logger.warning(f"❌ 群 {gid} 图片生成失败")
-                
             await asyncio.sleep(5)
 
     async def get_data(self, bot, group_id):
@@ -247,10 +257,21 @@ class GroupSummaryPlugin(Star):
         valid = []
         users = Counter()
         trend = Counter()
+        
         for m in msgs:
             if m.get("time", 0) < start: continue
             raw = m.get("raw_message", "")
-            nick = m.get("sender", {}).get("card") or m.get("sender", {}).get("nickname") or "用户"
+            
+            # --- 映射逻辑 ---
+            sender_info = m.get("sender", {})
+            user_id = str(sender_info.get("user_id", ""))
+            
+            nick = sender_info.get("card") or sender_info.get("nickname") or "用户"
+            
+            if self.enable_name_mapping and user_id in self.name_map:
+                nick = self.name_map[user_id]
+            # --------------
+
             if nick in self.exclude_users: continue
             
             content = raw[:200].replace("\n", " ") 
