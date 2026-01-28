@@ -27,7 +27,7 @@ def _parse_llm_json(text: str) -> dict:
         except: pass
     return {}
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.45")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.46")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -53,6 +53,13 @@ class GroupSummaryPlugin(Star):
                 self.html_template = f.read()
         except:
             self.html_template = "<h1>Template Not Found</h1>"
+            
+        # 检测环境提醒
+        try:
+            import playwright
+            logger.info("群聊总结(增强版): 本地渲染依赖已就绪。")
+        except:
+            logger.error("群聊总结(增强版): 严重警告！未检测到 playwright，请务必在容器内执行 `playwright install chromium --with-deps`")
 
         # 定时任务
         self.scheduler = AsyncIOScheduler()
@@ -91,7 +98,7 @@ class GroupSummaryPlugin(Star):
         if img:
             yield event.image_result(img)
         else:
-            yield event.plain_result("❌ 生成失败，请检查日志")
+            yield event.plain_result("❌ 生成失败，请检查是否在容器内运行了 playwright install chromium --with-deps")
 
     @filter.llm_tool(name="group_summary_tool")
     async def call_summary_tool(self, event: AstrMessageEvent):
@@ -158,7 +165,9 @@ class GroupSummaryPlugin(Star):
             nick = m.get("sender", {}).get("card") or m.get("sender", {}).get("nickname") or "用户"
             if nick in self.exclude_users: continue
             
-            valid.append({"time": m["time"], "name": nick, "content": raw[:100].replace("\n", " ")})
+            # 简单的清洗，避免太长
+            content = raw[:200].replace("\n", " ") 
+            valid.append({"time": m["time"], "name": nick, "content": content})
             users[nick] += 1
             trend[str(int(datetime.datetime.fromtimestamp(m["time"]).strftime("%H")))] += 1
             
@@ -202,21 +211,11 @@ class GroupSummaryPlugin(Star):
             "bot_name": self.bot_name
         }
         
-        # --- 策略：带参数渲染 ---
-        # 只保留基本的 viewport，移除 scale 等易报错参数
+        # --- 纯本地高清渲染参数 ---
+        # 远程服务器绝对不支持这些参数，但本地 Playwright 支持得很好
         options = {
-            "viewport": {"width": 500, "height": 2000}
+            "viewport": {"width": 500, "height": 2000},
+            "device_scale_factor": 2 # 2倍缩放，图片更清晰
         }
         
-        try:
-            return await self.html_render(self.html_template, render_data, options=options)
-        except Exception as e:
-            logger.warning(f"第一次渲染失败 (Options模式): {e}。尝试无参兜底模式...")
-            
-            # --- 策略：兜底重试 ---
-            # 如果上面依然报 400，说明远程服务器完全不接受 options，这里尝试裸奔
-            try:
-                return await self.html_render(self.html_template, render_data)
-            except Exception as final_e:
-                logger.error(f"最终渲染失败: {final_e}")
-                return None
+        return await self.html_render(self.html_template, render_data, options=options)
