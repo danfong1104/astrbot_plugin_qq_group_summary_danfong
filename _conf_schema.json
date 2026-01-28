@@ -66,5 +66,16 @@
         "hint": "LLM将根据此提示生成最后的'评语'，可用{bot_name}代表机器人名字",
         "type": "text",
         "default": "写一段“{bot_name}的悄悄话”作为总结，风格温暖、感性，对今天群里的氛围进行点评。"
+    },
+    "enable_name_mapping": {
+        "description": "【新】是否开启昵称映射 (将QQ号替换为指定名字)",
+        "type": "bool",
+        "default": false
+    },
+    "name_mapping": {
+        "description": "【新】昵称映射表 (格式: QQ号:新名字)",
+        "hint": "例如输入: 123456:张三。一行一个。",
+        "type": "list",
+        "default": []
     }
 }
