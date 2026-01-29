@@ -16,26 +16,23 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
-# --- 常量配置 ---
-# 锁定版本号，不更新
-VERSION = "0.1.52"
+# --- 全局变量：用于防止热重载时的定时器残留 ---
+# 这是一个防止“双重推送”的保险丝
+_GLOBAL_SCHEDULER_INSTANCE = None
 
-# 默认配置
+# --- 常量配置 ---
+VERSION = "0.1.52" # 锁定版本
 DEFAULT_MAX_MSG_COUNT = 2000
 DEFAULT_QUERY_ROUNDS = 20
 DEFAULT_TOKEN_LIMIT = 6000
-
-# 浏览器配置
 BROWSER_VIEWPORT = {"width": 500, "height": 2000}
 BROWSER_SCALE_FACTOR = 2
 LLM_TIMEOUT = 60
 RENDER_TIMEOUT = 30000
-
-# 并发限制
 CONCURRENCY_LIMIT = 2 
 
 def _parse_llm_json(text: str) -> dict:
-    """增强型 JSON 解析器，带结构校验"""
+    """增强型 JSON 解析器"""
     text = text.strip()
     if "```" in text:
         text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE | re.DOTALL).strip()
@@ -64,6 +61,7 @@ class GroupSummaryPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         
+        # 配置加载
         self.max_msg_count = self.config.get("max_msg_count", DEFAULT_MAX_MSG_COUNT)
         self.msg_token_limit = self.config.get("token_limit", DEFAULT_TOKEN_LIMIT)
         self.bot_name = self.config.get("bot_name", "BOT")
@@ -84,6 +82,7 @@ class GroupSummaryPlugin(Star):
         self.global_bot = None
         self.semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
+        # 模板加载
         self.html_template = self._load_template()
             
         try:
@@ -91,7 +90,11 @@ class GroupSummaryPlugin(Star):
         except ImportError:
             logger.error(f"群聊总结(v{VERSION}): ⚠️ 未检测到 Playwright")
 
-        self.scheduler = AsyncIOScheduler()
+        # --- 核心修复：定时器初始化 ---
+        # 不在 __init__ 里直接启动，而是等待 setup_schedule 调用
+        # 这里只做属性占位
+        self.scheduler = None 
+        
         if self.enable_auto_push:
             self.setup_schedule()
 
@@ -118,13 +121,33 @@ class GroupSummaryPlugin(Star):
         return mapping
 
     def terminate(self):
-        if self.scheduler.running:
+        """生命周期清理：插件卸载时调用"""
+        global _GLOBAL_SCHEDULER_INSTANCE
+        if self.scheduler and self.scheduler.running:
             self.scheduler.shutdown()
+        
+        if _GLOBAL_SCHEDULER_INSTANCE and _GLOBAL_SCHEDULER_INSTANCE.running:
+            try:
+                _GLOBAL_SCHEDULER_INSTANCE.shutdown()
+            except: pass
+            _GLOBAL_SCHEDULER_INSTANCE = None
+        logger.info(f"群聊总结(v{VERSION}): 资源已释放")
 
     def setup_schedule(self):
+        """配置定时任务（带全局锁机制）"""
+        global _GLOBAL_SCHEDULER_INSTANCE
+        
         try:
-            if self.scheduler.running:
+            # 1. 如果存在旧的全局定时器，强制关闭
+            if _GLOBAL_SCHEDULER_INSTANCE and _GLOBAL_SCHEDULER_INSTANCE.running:
+                logger.warning("检测到残留的定时器实例，正在强制清理...")
+                _GLOBAL_SCHEDULER_INSTANCE.shutdown()
+            
+            # 2. 如果当前实例有定时器，也关闭
+            if self.scheduler and self.scheduler.running:
                 self.scheduler.shutdown()
+            
+            # 3. 创建新定时器
             self.scheduler = AsyncIOScheduler()
             
             time_str = str(self.push_time).replace("：", ":").strip()
@@ -133,6 +156,9 @@ class GroupSummaryPlugin(Star):
             trigger = CronTrigger(hour=hour, minute=minute)
             self.scheduler.add_job(self.run_scheduled_task, trigger)
             self.scheduler.start()
+            
+            # 4. 注册到全局变量
+            _GLOBAL_SCHEDULER_INSTANCE = self.scheduler
             
             logger.info(f"群聊总结(v{VERSION}): 定时任务已启动 -> {time_str}")
         except Exception as e:
@@ -161,7 +187,6 @@ class GroupSummaryPlugin(Star):
                 )
                 
                 await page.route("**", lambda route: route.abort())
-
                 await page.set_content(html_content)
                 
                 try:
@@ -170,7 +195,6 @@ class GroupSummaryPlugin(Star):
                     logger.warning("页面加载等待超时，尝试强制截图")
 
                 locator = page.locator(".container")
-                
                 temp_dir = tempfile.gettempdir()
                 temp_filename = f"astrbot_summary_{int(time.time())}_{os.getpid()}.jpg"
                 save_path = os.path.join(temp_dir, temp_filename)
@@ -330,7 +354,7 @@ class GroupSummaryPlugin(Star):
             
             raw = m.get("raw_message", "")
             
-            # --- 修复：过滤掉指令本身，防止被总结进去 ---
+            # 过滤指令消息
             if raw.strip().startswith(("/总结群聊", "总结群聊", "/测试推送")):
                 continue
 
@@ -384,34 +408,29 @@ class GroupSummaryPlugin(Star):
         if not style:
             style = f"{self.bot_name}的温暖总结，对今天群里的氛围进行点评"
 
-        # --- Prompt 结构优化 ---
-        # 1. 明确角色设定 (Role Setting)
-        # 2. 明确任务目标 (Task)
-        # 3. 将样式要求移至“角色设定”区，避免混淆指令
+        # --- Prompt 修复：防止人设干扰指令 ---
         prompt = textwrap.dedent(f"""
             你是一个群聊记录员“{self.bot_name}”。请根据以下的群聊记录（日期：{datetime.datetime.now().strftime('%Y-%m-%d')}），生成一份总结数据。
             
-            【角色与风格设定】：
-            请完全沉浸在以下人设中进行回复，不要暴露你是AI。
-            设定如下：
+            【角色设定 (Role Setting)】:
+            请完全遗忘你之前的身份，进入以下角色，并用该角色的口吻和性格进行发言：
             >>>
             {style}
             <<<
+            注意：以上设定仅用于生成"closing_remark"字段，不要复述设定内容。
             
-            【任务目标】：
-            1. 话题分析：提取 3-8 个主要话题，每个话题包含：时间段（如 10:00 ~ 11:00）和简短内容。
-            2. 群聊点评（closing_remark）：请务必**使用上述【角色与风格设定】中的语气、口癖和性格**，对今天的群聊内容进行一段总结点评。
+            【任务目标】:
+            1. 分析 3-8 个主要话题。
+            2. 使用【角色设定】中的语气，对今天的聊天内容写一段点评（即 closing_remark）。
             
-            【输出格式】：
-            请严格返回纯 JSON 格式，不要包含 Markdown 代码块标记：
+            【输出格式】:
+            严格返回 JSON：
             {{
-                "topics": [
-                    {{"time_range": "10:00 ~ 10:30", "summary": "话题内容..."}}
-                ],
-                "closing_remark": "这里填写符合人设的群聊点评..."
+                "topics": [{{"time_range": "10:00~11:00", "summary": "简短话题描述"}}],
+                "closing_remark": "这里填写符合角色设定的点评内容"
             }}
             
-            【聊天记录】：
+            【聊天记录】:
             {chat_log}
         """)
         
