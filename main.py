@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Dict, Any, Tuple
 from pathlib import Path
 
+# 移除 MessageChain 等可能导致兼容性问题的导入
 from astrbot.api.all import Context, AstrMessageEvent, Star
 from astrbot.api.event import filter
 from astrbot.api import logger
@@ -29,7 +30,7 @@ class ChatMasterPlugin(Star):
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
         
-        # 1. 初始化 Global Bot (参考群聊总结插件)
+        # 1. 初始化 Global Bot (抄作业：参考群聊总结插件)
         self.global_bot = None
         
         self.data_dir: Path = StarTools.get_data_dir("astrbot_plugin_chatmaster")
@@ -52,7 +53,7 @@ class ChatMasterPlugin(Star):
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
         server_time = datetime.now().strftime("%H:%M")
-        logger.info(f"ChatMaster v2.1.5 已加载 (Native API Mode)。")
+        logger.info(f"ChatMaster v2.1.6 已加载 (Native API Call)。")
         logger.info(f" -> 数据路径: {self.data_file}")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
@@ -192,10 +193,10 @@ class ChatMasterPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
-        # 2. 捕获 Global Bot (参考参考代码)
+        # 2. 捕获 Global Bot (与参考代码一致)
         if not self.global_bot:
             self.global_bot = event.bot
-            logger.info("ChatMaster: 已捕获 Global Bot 实例，后台推送功能就绪。")
+            logger.info("ChatMaster: Bot 实例已捕获。")
 
         message_obj = event.message_obj
         if not message_obj.group_id or not message_obj.sender:
@@ -219,14 +220,14 @@ class ChatMasterPlugin(Star):
 
     @filter.command("聊天检测")
     async def manual_check(self, event: AstrMessageEvent):
+        # 确保手动指令也能捕获 bot
+        if not self.global_bot:
+            self.global_bot = event.bot
+
         message_obj = event.message_obj
         if not message_obj.group_id:
             yield event.plain_result("🚫 请在群聊中使用此命令。")
             return
-
-        # 确保手动指令也能捕获 bot
-        if not self.global_bot:
-            self.global_bot = event.bot
 
         group_id = str(message_obj.group_id)
         
@@ -314,7 +315,7 @@ class ChatMasterPlugin(Star):
             await self.save_data()
 
     async def run_inspection(self, send_message: bool = True):
-        # 3. 检查 Bot 实例是否存在
+        # 3. 检查 Bot 实例 (参考代码逻辑)
         if not self.global_bot:
             if send_message:
                 logger.warning("ChatMaster: 尚未捕获 Bot 实例（插件启动后尚未收到消息），跳过本次推送。")
@@ -391,19 +392,17 @@ class ChatMasterPlugin(Star):
                         final_msg = "\n".join(msg_list)
                         full_text = f"📢 潜水员日报：\n{final_msg}"
                         
-                        # 4. 核心修复：使用 OneBot 标准 API 发送 (参考群聊总结插件)
-                        # 直接调用 call_action("send_group_msg", ...)
+                        # 4. 核心：抄作业！直接调用 Bot 的 API
+                        # 参考自 GroupSummaryPlugin: await self.global_bot.api.call_action("send_group_msg", ...)
                         try:
-                            await asyncio.wait_for(
-                                self.global_bot.api.call_action(
-                                    "send_group_msg", 
-                                    group_id=int(group_id), # 必须转 int
-                                    message=full_text
-                                ),
-                                timeout=self.SEND_TIMEOUT
+                            await self.global_bot.api.call_action(
+                                "send_group_msg",
+                                group_id=int(group_id), # 强制转 int，OneBot 规范
+                                message=full_text       # 直接传字符串，避免 MessageChain 对象报错
                             )
+                            logger.info(f"ChatMaster: ✅ 群 {group_id} 推送成功")
                         except Exception as e:
-                            logger.error(f"ChatMaster: 群 {group_id} 推送失败 (Native API): {e}")
+                            logger.error(f"ChatMaster: ❌ 群 {group_id} 推送失败: {e}")
 
                     else:
                         log_lines.append(f"  -> 结论: ⚠️ 发现潜水人员，但设置为不发送。")
