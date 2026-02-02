@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Dict, Any, Tuple
 from pathlib import Path
 
-# 1. 极其纯净的导入，不导入任何 MessageChain 相关组件
+# 1. 纯净导入，绝不引入 MessageChain
 from astrbot.api.all import Context, AstrMessageEvent, Star
 from astrbot.api.event import filter
 from astrbot.api import logger
@@ -30,7 +30,7 @@ class ChatMasterPlugin(Star):
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
         
-        # 全局 Bot 实例 (核心发送器)
+        # 全局 Bot 实例
         self.global_bot = None
         
         self.data_dir: Path = StarTools.get_data_dir("astrbot_plugin_chatmaster")
@@ -53,7 +53,8 @@ class ChatMasterPlugin(Star):
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
         server_time = datetime.now().strftime("%H:%M")
-        logger.info(f"ChatMaster v2.1.7 已加载 (Nuclear Option)。")
+        # ⚠️ 请确认启动日志里显示的是 v2.1.8 ⚠️
+        logger.info(f"ChatMaster v2.1.8 (Final Check) 已加载。")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
@@ -192,10 +193,10 @@ class ChatMasterPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
-        # 2. 捕获 Bot 实例 (核心：这是唯一的发送依赖)
+        # 捕获 Bot 实例
         if not self.global_bot:
             self.global_bot = event.bot
-            logger.info("ChatMaster: 已成功捕获 Bot 实例。")
+            logger.info("ChatMaster: Bot 实例已捕获。")
 
         message_obj = event.message_obj
         if not message_obj.group_id or not message_obj.sender:
@@ -219,7 +220,6 @@ class ChatMasterPlugin(Star):
 
     @filter.command("聊天检测")
     async def manual_check(self, event: AstrMessageEvent):
-        # 确保手动指令也能捕获 bot
         if not self.global_bot:
             self.global_bot = event.bot
 
@@ -314,7 +314,7 @@ class ChatMasterPlugin(Star):
             await self.save_data()
 
     async def run_inspection(self, send_message: bool = True):
-        # 3. 如果没捕获到 Bot，直接报错并跳过
+        # 3. 检查 Bot 实例
         if not self.global_bot:
             if send_message:
                 logger.error("ChatMaster: ❌ 严重错误 - 尚未捕获 Bot 实例。请确保插件启动后，群里至少有一条新消息（任意人发送）。")
@@ -391,14 +391,13 @@ class ChatMasterPlugin(Star):
                         final_msg = "\n".join(msg_list)
                         full_text = f"📢 潜水员日报：\n{final_msg}"
                         
-                        # 4. 终极调用：完全照搬参考代码
+                        # 4. 终极调用：抄作业 (send_group_msg)
                         try:
-                            # 强制转为字符串，确保万无一失
+                            # 强制转 int，防止 group_id 是字符串导致 OneBot 报错
                             group_id_int = int(str(group_id))
                             msg_str = str(full_text)
                             
-                            logger.info(f"ChatMaster: 尝试调用 Native API (send_group_msg) -> 群: {group_id_int}")
-                            
+                            # 这里没有 MessageChain，没有 _send_safe，只有最纯粹的 API 调用
                             await asyncio.wait_for(
                                 self.global_bot.api.call_action(
                                     "send_group_msg", 
