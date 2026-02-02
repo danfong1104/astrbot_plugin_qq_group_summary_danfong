@@ -1,465 +1,417 @@
-import json
 import os
-import re
-import datetime
+import json
 import time
 import asyncio
-import jinja2
-import base64
+import copy
 import tempfile
-import textwrap
-from collections import Counter
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+from datetime import datetime
+from typing import Dict, Any, Tuple
+from pathlib import Path
 
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.all import Context, AstrMessageEvent, Star
+from astrbot.api.event import filter
 from astrbot.api import logger
+from astrbot.api.star import StarTools
 
-# --- 全局变量：用于防止热重载时的定时器残留 ---
-# 这是一个防止“双重推送”的保险丝
-_GLOBAL_SCHEDULER_INSTANCE = None
+class ChatMasterPlugin(Star):
+    SAVE_INTERVAL = 300       # 自动保存间隔
+    CHECK_INTERVAL = 60       # 检查循环间隔
+    CLEANUP_INTERVAL = 86400  # 强制清理间隔
+    MAX_RETRIES = 3           # 推送重试次数
+    CLEANUP_DAYS = 90         # 僵尸数据阈值
+    MAX_DISPLAY_COUNT = 50    # 单条消息最大显示人数
+    SEND_TIMEOUT = 15.0       # 推送超时 (秒)
 
-# --- 常量配置 ---
-VERSION = "0.1.52" # 锁定版本
-DEFAULT_MAX_MSG_COUNT = 2000
-DEFAULT_QUERY_ROUNDS = 20
-DEFAULT_TOKEN_LIMIT = 6000
-BROWSER_VIEWPORT = {"width": 500, "height": 2000}
-BROWSER_SCALE_FACTOR = 2
-LLM_TIMEOUT = 60
-RENDER_TIMEOUT = 30000
-CONCURRENCY_LIMIT = 2 
-
-def _parse_llm_json(text: str) -> dict:
-    """增强型 JSON 解析器"""
-    text = text.strip()
-    if "```" in text:
-        text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE | re.DOTALL).strip()
-    
-    data = {}
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        try:
-            match = re.search(r"\{[\s\S]*\}", text)
-            if match: 
-                data = json.loads(match.group())
-        except Exception: 
-            pass
-            
-    if not isinstance(data, dict):
-        return {}
-    
-    data.setdefault("topics", [])
-    data.setdefault("closing_remark", "数据解析异常")
-    return data
-
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", VERSION)
-class GroupSummaryPlugin(Star):
-    def __init__(self, context: Context, config: dict = None):
+    def __init__(self, context: Context, config: dict):
         super().__init__(context)
-        self.config = config or {}
+        self.config = config
+        self.data_changed = False 
+        self.last_save_time = time.time()
+        self.last_cleanup_time = time.time()
         
-        # 配置加载
-        self.max_msg_count = self.config.get("max_msg_count", DEFAULT_MAX_MSG_COUNT)
-        self.msg_token_limit = self.config.get("token_limit", DEFAULT_TOKEN_LIMIT)
-        self.bot_name = self.config.get("bot_name", "BOT")
-        self.exclude_users = set(self.config.get("exclude_users", []))
-        self.enable_auto_push = self.config.get("enable_auto_push", False)
-        self.push_time = self.config.get("push_time", "23:00")
-        self.push_groups = self.config.get("push_groups", [])
-        self.summary_prompt_style = self.config.get("summary_prompt_style", "")
-        
-        self.max_query_rounds = max(
-            self.config.get("max_query_rounds", DEFAULT_QUERY_ROUNDS),
-            (self.max_msg_count // 100) + 2
-        )
-
-        self.enable_name_mapping = self.config.get("enable_name_mapping", False)
-        self.name_map = self._load_name_mapping()
-        
+        # 1. 初始化 Global Bot (参考群聊总结插件)
         self.global_bot = None
-        self.semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-
-        # 模板加载
-        self.html_template = self._load_template()
-            
-        try:
-            import playwright
-        except ImportError:
-            logger.error(f"群聊总结(v{VERSION}): ⚠️ 未检测到 Playwright")
-
-        # --- 核心修复：定时器初始化 ---
-        # 不在 __init__ 里直接启动，而是等待 setup_schedule 调用
-        # 这里只做属性占位
-        self.scheduler = None 
         
-        if self.enable_auto_push:
-            self.setup_schedule()
+        self.data_dir: Path = StarTools.get_data_dir("astrbot_plugin_chatmaster")
+        self.data_file = self.data_dir / "data.json"
+        
+        if not self.data_dir.exists():
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.data = self.load_data()
+        
+        self.nickname_cache = {}
+        self.monitored_groups_set = set()
+        self.exception_groups_set = set()
+        self.enable_whitelist_global = True
+        self.enable_mapping = True
+        
+        self.last_processed_minute = -1
+        
+        self.refresh_config_cache()
+        self.push_time_h, self.push_time_m = self._parse_push_time()
+        
+        server_time = datetime.now().strftime("%H:%M")
+        logger.info(f"ChatMaster v2.1.5 已加载 (Native API Mode)。")
+        logger.info(f" -> 数据路径: {self.data_file}")
+        logger.info(f" -> 服务器时间: {server_time}")
+        logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
-    def _load_template(self) -> str:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        template_path = os.path.join(current_dir, "templates", "report.html")
+        self.cleanup_task = asyncio.create_task(self._cleanup_old_data_async())
+        self.scheduler_task = asyncio.create_task(self.scheduler_loop())
+
+    def _parse_push_time(self) -> Tuple[int, int]:
+        push_time_str = self.config.get("push_time", "09:00")
+        push_time_str = str(push_time_str).replace("：", ":")
         try:
-            with open(template_path, "r", encoding="utf-8") as f:
-                return f.read()
-        except Exception as e:
-            logger.error(f"模板加载失败: {e}")
-            return "<h1>Template Load Error</h1>"
+            t = datetime.strptime(push_time_str, "%H:%M")
+            return t.hour, t.minute
+        except ValueError:
+            logger.error(f"ChatMaster 配置错误: 推送时间 '{push_time_str}' 格式无效。已重置为 09:00")
+            return 9, 0
 
-    def _load_name_mapping(self) -> dict:
-        raw_list = self.config.get("name_mapping", [])
+    def refresh_config_cache(self):
+        self.enable_whitelist_global = self.config.get("enable_whitelist", True)
+        self.enable_mapping = self.config.get("enable_nickname_mapping", True)
+        
+        raw_groups = self.config.get("monitored_groups", [])
+        self.monitored_groups_set = set(str(g) for g in raw_groups)
+        
+        raw_exceptions = self.config.get("whitelist_exception_groups", [])
+        self.exception_groups_set = set(str(g) for g in raw_exceptions)
+
         mapping = {}
+        raw_list = self.config.get("nickname_mapping", [])
         if raw_list:
             for item in raw_list:
-                item = str(item).strip().replace("：", ":")
-                if ":" in item:
-                    parts = item.split(":", 1)
-                    if len(parts) == 2:
-                        mapping[parts[0].strip()] = parts[1].strip()
-        return mapping
-
-    def terminate(self):
-        """生命周期清理：插件卸载时调用"""
-        global _GLOBAL_SCHEDULER_INSTANCE
-        if self.scheduler and self.scheduler.running:
-            self.scheduler.shutdown()
-        
-        if _GLOBAL_SCHEDULER_INSTANCE and _GLOBAL_SCHEDULER_INSTANCE.running:
-            try:
-                _GLOBAL_SCHEDULER_INSTANCE.shutdown()
-            except: pass
-            _GLOBAL_SCHEDULER_INSTANCE = None
-        logger.info(f"群聊总结(v{VERSION}): 资源已释放")
-
-    def setup_schedule(self):
-        """配置定时任务（带全局锁机制）"""
-        global _GLOBAL_SCHEDULER_INSTANCE
-        
-        try:
-            # 1. 如果存在旧的全局定时器，强制关闭
-            if _GLOBAL_SCHEDULER_INSTANCE and _GLOBAL_SCHEDULER_INSTANCE.running:
-                logger.warning("检测到残留的定时器实例，正在强制清理...")
-                _GLOBAL_SCHEDULER_INSTANCE.shutdown()
-            
-            # 2. 如果当前实例有定时器，也关闭
-            if self.scheduler and self.scheduler.running:
-                self.scheduler.shutdown()
-            
-            # 3. 创建新定时器
-            self.scheduler = AsyncIOScheduler()
-            
-            time_str = str(self.push_time).replace("：", ":").strip()
-            hour, minute = map(int, time_str.split(":"))
-            
-            trigger = CronTrigger(hour=hour, minute=minute)
-            self.scheduler.add_job(self.run_scheduled_task, trigger)
-            self.scheduler.start()
-            
-            # 4. 注册到全局变量
-            _GLOBAL_SCHEDULER_INSTANCE = self.scheduler
-            
-            logger.info(f"群聊总结(v{VERSION}): 定时任务已启动 -> {time_str}")
-        except Exception as e:
-            logger.error(f"定时任务启动失败: {e}")
-
-    async def render_locally(self, html_template: str, data: dict):
-        from playwright.async_api import async_playwright
-        
-        try:
-            env = jinja2.Environment(autoescape=True)
-            template = env.from_string(html_template)
-            html_content = template.render(**data)
-        except Exception as e:
-            logger.error(f"Jinja2 渲染异常: {e}")
-            return None
-
-        browser = None
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    args=["--no-sandbox", "--disable-setuid-sandbox"]
-                )
-                page = await browser.new_page(
-                    viewport=BROWSER_VIEWPORT,
-                    device_scale_factor=BROWSER_SCALE_FACTOR
-                )
-                
-                await page.route("**", lambda route: route.abort())
-                await page.set_content(html_content)
-                
                 try:
-                    await page.wait_for_load_state("load", timeout=RENDER_TIMEOUT)
+                    if isinstance(item, dict):
+                        for k, v in item.items():
+                            mapping[str(k).strip()] = str(v).strip()
+                    else:
+                        item_str = str(item)
+                        parts = []
+                        if ":" in item_str:
+                            parts = item_str.split(":", 1)
+                        elif "：" in item_str:
+                            parts = item_str.split("：", 1)
+                        
+                        if len(parts) == 2:
+                            qq = parts[0].strip()
+                            name = parts[1].strip()
+                            mapping[qq] = name
                 except Exception:
-                    logger.warning("页面加载等待超时，尝试强制截图")
+                    continue
+        self.nickname_cache = mapping
 
-                locator = page.locator(".container")
-                temp_dir = tempfile.gettempdir()
-                temp_filename = f"astrbot_summary_{int(time.time())}_{os.getpid()}.jpg"
-                save_path = os.path.join(temp_dir, temp_filename)
-                
-                await locator.screenshot(path=save_path, type="jpeg", quality=90)
-                return save_path
-                
+    def _is_group_whitelist_mode(self, group_id: str) -> bool:
+        mode = self.enable_whitelist_global
+        if group_id in self.exception_groups_set:
+            mode = not mode
+        return mode
+
+    def load_data(self) -> Dict[str, Any]:
+        default_data = {"global_last_run_date": "", "groups": {}}
+        if not self.data_file.exists():
+            return default_data
+        try:
+            content = self.data_file.read_text(encoding='utf-8').strip()
+            if not content:
+                return default_data
+            loaded = json.loads(content)
+            if not isinstance(loaded, dict):
+                return default_data
+            if "groups" not in loaded or not isinstance(loaded["groups"], dict):
+                loaded["groups"] = {}
+            if "global_last_run_date" not in loaded:
+                loaded["global_last_run_date"] = ""
+            return loaded
         except Exception as e:
-            logger.error(f"Playwright 渲染失败: {str(e)}")
-            return None
-        finally:
-            if browser:
-                await browser.close()
+            logger.error(f"ChatMaster 加载数据失败: {e}，使用空数据。")
+            return default_data
+
+    def _save_data_atomic(self, data_snapshot: Dict[str, Any]):
+        temp_path = None
+        try:
+            fd, temp_path = tempfile.mkstemp(dir=self.data_dir, text=False)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(data_snapshot, f, ensure_ascii=False, indent=2)
+            os.replace(temp_path, self.data_file)
+        except Exception as e:
+            logger.error(f"ChatMaster 保存数据失败: {e}")
+            if temp_path and os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except: pass
+
+    async def save_data(self):
+        if not self.data_changed:
+            return
+        try:
+            data_snapshot = self.data.copy()
+            await asyncio.to_thread(self._save_data_atomic, data_snapshot)
+            self.data_changed = False
+            self.last_save_time = time.time()
+        except Exception as e:
+            logger.error(f"ChatMaster 异步保存出错: {e}")
+
+    async def _cleanup_old_data_async(self):
+        if not self.data.get("groups"):
+            return
+        cutoff_time = time.time() - (self.CLEANUP_DAYS * 24 * 3600)
+        removed_count = 0
+        groups_to_check = list(self.data["groups"].keys())
+        
+        for i, group_id in enumerate(groups_to_check):
+            if i % 10 == 0: await asyncio.sleep(0)
+            
+            group_data = self.data["groups"].get(group_id)
+            if group_data is None: continue
+                
+            users_to_remove = [uid for uid, ts in group_data.items() if ts < cutoff_time]
+            for uid in users_to_remove:
+                del group_data[uid]
+                removed_count += 1
+                
+        if removed_count > 0:
+            logger.info(f"ChatMaster: 自动清理了 {removed_count} 条过期数据。")
+            self.data_changed = True
+
+    async def terminate(self):
+        if self.scheduler_task: self.scheduler_task.cancel()
+        if hasattr(self, 'cleanup_task') and self.cleanup_task: self.cleanup_task.cancel()
+        try:
+            self._save_data_atomic(self.data)
+            logger.info("ChatMaster 插件已停止，数据已保存。")
+        except Exception as e:
+            logger.error(f"ChatMaster 停止时保存失败: {e}")
+
+    def _get_display_name(self, user_id: str) -> str:
+        if self.enable_mapping and user_id in self.nickname_cache:
+            return self.nickname_cache[user_id]
+        return f"用户{user_id}"
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def capture_bot(self, event: AstrMessageEvent):
-        if not self.global_bot: 
+    async def on_message(self, event: AstrMessageEvent):
+        # 2. 捕获 Global Bot (参考参考代码)
+        if not self.global_bot:
             self.global_bot = event.bot
-            logger.info(f"群聊总结: Bot 实例已捕获。")
+            logger.info("ChatMaster: 已捕获 Global Bot 实例，后台推送功能就绪。")
 
-    @filter.command("总结群聊")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def summarize_group(self, event: AstrMessageEvent):
-        if not self.global_bot: self.global_bot = event.bot
-        group_id = event.get_group_id()
-        if not group_id: 
-            yield event.plain_result("请在群聊使用")
+        message_obj = event.message_obj
+        if not message_obj.group_id or not message_obj.sender:
             return
-        
-        yield event.plain_result("🌱 正在回溯记忆并生成报告...")
-        
-        async with self.semaphore:
-            img_path = await self.generate_report(event.bot, group_id)
-        
-        if img_path and os.path.exists(img_path):
-            yield event.image_result(img_path)
-            await asyncio.sleep(2)
-            try: os.remove(img_path)
-            except: pass
-        else:
-            yield event.plain_result("❌ 生成失败，请检查日志。")
 
-    @filter.command("测试推送")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def test_push(self, event: AstrMessageEvent):
-        if not self.global_bot: self.global_bot = event.bot
-        yield event.plain_result("🚀 开始测试推送流程...")
-        await self.run_scheduled_task()
-        yield event.plain_result("✅ 测试指令结束。")
-
-    @filter.llm_tool(name="group_summary_tool")
-    async def call_summary_tool(self, event: AstrMessageEvent):
-        if not self.global_bot: self.global_bot = event.bot
-        group_id = event.get_group_id()
-        if not group_id: 
-            yield event.plain_result("仅限群聊")
+        group_id = str(message_obj.group_id)
+        user_id = str(message_obj.sender.user_id)
+        
+        if group_id not in self.monitored_groups_set:
             return
-        
-        yield event.plain_result("🌱 正在分析...")
-        async with self.semaphore:
-            img_path = await self.generate_report(event.bot, group_id)
-        
-        if img_path and os.path.exists(img_path):
-            yield event.image_result(img_path)
-            await asyncio.sleep(2)
-            try: os.remove(img_path)
-            except: pass
-        else:
-            yield event.plain_result("生成失败")
 
-    async def _process_single_group_task(self, group_id):
-        logger.info(f"正在为群 {group_id} 生成日报...")
-        async with self.semaphore:
-            img_path = await self.generate_report(self.global_bot, str(group_id), silent=True)
+        use_whitelist = self._is_group_whitelist_mode(group_id)
+        if use_whitelist and user_id not in self.nickname_cache:
+            return 
         
-        if img_path and os.path.exists(img_path):
-            try:
-                with open(img_path, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode()
-                await self.global_bot.api.call_action(
-                    "send_group_msg", 
-                    group_id=int(group_id), 
-                    message=f"[CQ:image,file=base64://{b64}]"
-                )
-                logger.info(f"✅ 群 {group_id} 推送成功")
-            except Exception as e:
-                logger.error(f"❌ 群 {group_id} 发送失败: {e}")
-            finally:
-                try: os.remove(img_path)
-                except: pass
-        else:
-            logger.warning(f"群 {group_id} 报告生成失败")
+        if group_id not in self.data["groups"]:
+            self.data["groups"][group_id] = {}
 
-    async def run_scheduled_task(self):
-        if not self.global_bot or not self.push_groups:
+        self.data["groups"][group_id][user_id] = time.time()
+        self.data_changed = True 
+
+    @filter.command("聊天检测")
+    async def manual_check(self, event: AstrMessageEvent):
+        message_obj = event.message_obj
+        if not message_obj.group_id:
+            yield event.plain_result("🚫 请在群聊中使用此命令。")
             return
-        
-        logger.info("⏳ 定时推送开始...")
-        tasks = [self._process_single_group_task(gid) for gid in self.push_groups]
-        if tasks:
-            await asyncio.gather(*tasks)
-        logger.info("✅ 定时推送完成")
 
-    async def get_data(self, bot, group_id):
-        now = datetime.datetime.now()
-        start = now.replace(hour=0, minute=0, second=0).timestamp()
-        
-        msgs = []
-        seq = 0
-        seen_ids = set()
+        # 确保手动指令也能捕获 bot
+        if not self.global_bot:
+            self.global_bot = event.bot
 
-        for _ in range(self.max_query_rounds):
-            if len(msgs) >= self.max_msg_count:
+        group_id = str(message_obj.group_id)
+        
+        if group_id not in self.data["groups"] or not self.data["groups"][group_id]:
+            yield event.plain_result(f"📭 群 ({group_id}) 暂无监控数据。")
+            return
+
+        group_data = self.data["groups"][group_id]
+        msg_lines = [f"📊 群 ({group_id}) 活跃度数据概览："]
+        
+        now = time.time()
+        count = 0
+        
+        self.refresh_config_cache()
+        use_whitelist = self._is_group_whitelist_mode(group_id)
+        mode_str = "白名单模式" if use_whitelist else "全员监控模式"
+        msg_lines.append(f"当前模式: {mode_str}")
+        
+        user_items = list(group_data.items())
+        
+        for i, (user_id, last_seen_ts) in enumerate(user_items):
+            if i % 50 == 0: await asyncio.sleep(0)
+
+            if use_whitelist and user_id not in self.nickname_cache:
+                continue
+            
+            if count >= self.MAX_DISPLAY_COUNT:
+                msg_lines.append(f"\n⚠️ (名单过长，系统截断前 {self.MAX_DISPLAY_COUNT} 位显示)")
                 break
+
+            nickname = self._get_display_name(user_id)
+            last_seen_dt = datetime.fromtimestamp(last_seen_ts)
+            last_seen_str = last_seen_dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            diff_seconds = now - last_seen_ts
+            days = int(diff_seconds // 86400)
+            
+            status_emoji = "🟢" if days < 1 else "🔴"
+            msg_lines.append(f"{status_emoji} {nickname} | 未发言: {days}天 | 最后: {last_seen_str}")
+            count += 1
+
+        msg_lines.append(f"\n共记录 {count} 人。")
+        yield event.plain_result("\n".join(msg_lines))
+
+    @filter.command("重置检测")
+    async def reset_check_status(self, event: AstrMessageEvent):
+        self.last_processed_minute = -1
+        yield event.plain_result("✅ 调度器状态已重置，下一分钟即可再次触发。")
+
+    async def scheduler_loop(self):
+        while True:
             try:
-                ret = await bot.api.call_action(
-                    "get_group_msg_history", 
-                    group_id=group_id, 
-                    count=100, 
-                    message_seq=seq, 
-                    reverseOrder=True
-                )
-                batch = ret.get("messages", [])
-                if not batch:
-                    break
+                self.refresh_config_cache()
+                target_h, target_m = self._parse_push_time()
+                await self.check_schedule(target_h, target_m)
                 
-                oldest_in_batch = batch[-1].get("time", 0)
-                newest_in_batch = batch[0].get("time", 0)
-                seq = batch[-1].get("message_seq")
-                
-                if oldest_in_batch > newest_in_batch:
-                    seq = batch[0].get("message_seq")
-                    oldest_in_batch = newest_in_batch
-                
-                for m in batch:
-                    mid = m.get("message_id")
-                    if mid and mid not in seen_ids:
-                        seen_ids.add(mid)
-                        msgs.append(m)
-                
-                if oldest_in_batch < start:
-                    break
-                if not seq:
-                    break
+                if time.time() - self.last_cleanup_time > self.CLEANUP_INTERVAL:
+                    await self._cleanup_old_data_async()
+                    self.last_cleanup_time = time.time()
+
+                if self.data_changed and (time.time() - self.last_save_time > self.SAVE_INTERVAL):
+                    await self.save_data()
                     
-            except Exception as e:
-                logger.error(f"获取消息历史失败: {e}")
+            except asyncio.CancelledError:
                 break
-        
-        valid = []
-        users = Counter()
-        trend = {f"{h:02d}": 0 for h in range(24)}
-        
-        for m in msgs:
-            if m.get("time", 0) < start:
-                continue
-            
-            raw = m.get("raw_message", "")
-            
-            # 过滤指令消息
-            if raw.strip().startswith(("/总结群聊", "总结群聊", "/测试推送")):
-                continue
-
-            sender = m.get("sender", {})
-            user_id = str(sender.get("user_id", ""))
-            nick = sender.get("card") or sender.get("nickname") or "用户"
-            
-            if nick in self.exclude_users or user_id in self.exclude_users:
-                continue
-
-            if self.enable_name_mapping and user_id in self.name_map:
-                nick = self.name_map[user_id]
-            
-            content = raw.replace("\n", " ") 
-            if len(content) > 300:
-                content = content[:300] + "..."
-            
-            valid.append({"time": m["time"], "name": nick, "content": content})
-            users[nick] += 1
-            
-            hour_key = datetime.datetime.fromtimestamp(m["time"]).strftime("%H")
-            if hour_key in trend:
-                trend[hour_key] += 1
-            
-        valid.sort(key=lambda x: x["time"])
-        
-        chat_log = "\n".join([
-            f"[{datetime.datetime.fromtimestamp(v['time']).strftime('%H:%M')}] {v['name']}: {v['content']}" 
-            for v in valid
-        ])
-        
-        return valid, [{"name": k, "count": v} for k,v in users.most_common(5)], trend, chat_log
-
-    async def generate_report(self, bot, group_id, silent=False):
-        try:
-            info = await bot.api.call_action("get_group_info", group_id=group_id)
-        except Exception:
-            info = {"group_name": "群聊"}
-        
-        res = await self.get_data(bot, group_id)
-        if not res or not res[0]:
-            if not silent: logger.warning(f"群 {group_id} 无数据。")
-            return None
-            
-        valid_msgs, top_users, trend, chat_log = res
-        
-        if len(chat_log) > self.msg_token_limit:
-            chat_log = chat_log[-self.msg_token_limit:]
-
-        style = self.summary_prompt_style.replace("{bot_name}", self.bot_name)
-        if not style:
-            style = f"{self.bot_name}的温暖总结，对今天群里的氛围进行点评"
-
-        # --- Prompt 修复：防止人设干扰指令 ---
-        prompt = textwrap.dedent(f"""
-            你是一个群聊记录员“{self.bot_name}”。请根据以下的群聊记录（日期：{datetime.datetime.now().strftime('%Y-%m-%d')}），生成一份总结数据。
-            
-            【角色设定 (Role Setting)】:
-            请完全遗忘你之前的身份，进入以下角色，并用该角色的口吻和性格进行发言：
-            >>>
-            {style}
-            <<<
-            注意：以上设定仅用于生成"closing_remark"字段，不要复述设定内容。
-            
-            【任务目标】:
-            1. 分析 3-8 个主要话题。
-            2. 使用【角色设定】中的语气，对今天的聊天内容写一段点评（即 closing_remark）。
-            
-            【输出格式】:
-            严格返回 JSON：
-            {{
-                "topics": [{{"time_range": "10:00~11:00", "summary": "简短话题描述"}}],
-                "closing_remark": "这里填写符合角色设定的点评内容"
-            }}
-            
-            【聊天记录】:
-            {chat_log}
-        """)
-        
-        data = {}
-        prov = self.context.get_provider_by_id(self.config.get("provider_id")) or self.context.get_using_provider()
-        
-        if prov:
-            try:
-                response = await asyncio.wait_for(
-                    prov.text_chat(prompt), 
-                    timeout=LLM_TIMEOUT
-                )
-                data = _parse_llm_json(response.completion_text)
-            except asyncio.TimeoutError:
-                logger.error("LLM 请求超时")
             except Exception as e:
-                logger.error(f"LLM 错误: {e}")
-        
-        if not data:
-            data = {"topics": [], "closing_remark": "AI 总结生成失败，请检查网络或配置。"}
+                logger.error(f"ChatMaster 调度出错: {e}")
+            
+            await asyncio.sleep(self.CHECK_INTERVAL)
 
-        render_data = {
-            "date": datetime.datetime.now().strftime("%Y.%m.%d"),
-            "top_users": top_users,
-            "trend": trend,
-            "topics": data.get("topics", []),
-            "summary_text": data.get("closing_remark", ""),
-            "group_name": info.get("group_name"),
-            "bot_name": self.bot_name
-        }
+    async def check_schedule(self, target_h: int, target_m: int):
+        now = datetime.now()
+        current_minutes = now.hour * 60 + now.minute
+        target_minutes = target_h * 60 + target_m
         
-        return await self.render_locally(self.html_template, render_data)
+        if current_minutes == self.last_processed_minute:
+            return
+        
+        if current_minutes == target_minutes:
+            self.last_processed_minute = current_minutes
+            logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d}，执行任务...")
+            await self.run_inspection(send_message=True)
+            self.data["global_last_run_date"] = now.strftime("%Y-%m-%d")
+            self.data_changed = True
+            await self.save_data()
+
+    async def run_inspection(self, send_message: bool = True):
+        # 3. 检查 Bot 实例是否存在
+        if not self.global_bot:
+            if send_message:
+                logger.warning("ChatMaster: 尚未捕获 Bot 实例（插件启动后尚未收到消息），跳过本次推送。")
+            return
+
+        timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
+        timeout_seconds = timeout_days_cfg * 24 * 3600
+        template = self.config.get("alert_template", "“{nickname}”已经“{days}”天没发言了")
+        now_ts = time.time()
+
+        if not self.monitored_groups_set:
+            return
+
+        for group_id in self.monitored_groups_set:
+            try:
+                group_data = self.data["groups"].get(group_id, {})
+                use_whitelist = self._is_group_whitelist_mode(group_id)
+                mode_str = "白名单" if use_whitelist else "全员"
+                
+                log_lines = []
+                log_lines.append(f"ChatMaster: 检测群 {group_id} [{mode_str}]...")
+
+                if not group_data:
+                    log_lines.append("  -> 暂无活跃数据。")
+                    logger.info("\n".join(log_lines))
+                    continue
+
+                msg_list = []
+                active_names = []
+                inactive_names = []
+                
+                user_items = list(group_data.items())
+                count = 0 
+                for i, (user_id, last_seen_ts) in enumerate(user_items):
+                    if i % 50 == 0: await asyncio.sleep(0)
+
+                    if use_whitelist and user_id not in self.nickname_cache:
+                        continue
+                    
+                    nickname = self._get_display_name(user_id)
+                    time_diff = now_ts - last_seen_ts
+                    
+                    if time_diff >= timeout_seconds:
+                        days_silent = int(time_diff // 86400)
+                        last_seen_str = datetime.fromtimestamp(last_seen_ts).strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        if count < self.MAX_DISPLAY_COUNT:
+                            line = template.format(
+                                nickname=nickname, 
+                                days=days_silent, 
+                                last_seen=last_seen_str
+                            )
+                            msg_list.append(line)
+                        
+                        inactive_names.append(f"{nickname}({days_silent}天)")
+                    else:
+                        active_names.append(nickname)
+                    
+                    count += 1
+                
+                if count > self.MAX_DISPLAY_COUNT and len(msg_list) >= self.MAX_DISPLAY_COUNT:
+                     msg_list.append(f"\n⚠️ (名单过长，系统截断前 {self.MAX_DISPLAY_COUNT} 位显示)")
+
+                if active_names:
+                    log_lines.append(f"  🟢 活跃人员 ({len(active_names)}): {', '.join(active_names[:100])}{'...' if len(active_names)>100 else ''}")
+                if inactive_names:
+                    log_lines.append(f"  🔴 潜水人员 ({len(inactive_names)}): {', '.join(inactive_names[:100])}{'...' if len(inactive_names)>100 else ''}")
+
+                if msg_list:
+                    if send_message:
+                        log_lines.append(f"  -> 结论: ❌ 发现 {len(inactive_names)} 人潜水，正在推送...")
+                        logger.info("\n".join(log_lines))
+                        
+                        final_msg = "\n".join(msg_list)
+                        full_text = f"📢 潜水员日报：\n{final_msg}"
+                        
+                        # 4. 核心修复：使用 OneBot 标准 API 发送 (参考群聊总结插件)
+                        # 直接调用 call_action("send_group_msg", ...)
+                        try:
+                            await asyncio.wait_for(
+                                self.global_bot.api.call_action(
+                                    "send_group_msg", 
+                                    group_id=int(group_id), # 必须转 int
+                                    message=full_text
+                                ),
+                                timeout=self.SEND_TIMEOUT
+                            )
+                        except Exception as e:
+                            logger.error(f"ChatMaster: 群 {group_id} 推送失败 (Native API): {e}")
+
+                    else:
+                        log_lines.append(f"  -> 结论: ⚠️ 发现潜水人员，但设置为不发送。")
+                        logger.info("\n".join(log_lines))
+                else:
+                    log_lines.append("  -> 结论: ✅ 全员活跃 (无需推送)。")
+                    logger.info("\n".join(log_lines))
+
+            except Exception as e:
+                logger.error(f"ChatMaster: 处理群 {group_id} 错误: {e}")
+                continue
