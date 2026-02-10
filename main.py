@@ -20,7 +20,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 # --- 全局常量 ---
-VERSION = "0.1.42-PromptFix" # 更新版本号
+VERSION = "0.1.43-FinalParam"
 API_GET_GROUP_MSG_HISTORY = "get_group_msg_history"
 API_GET_GROUP_INFO = "get_group_info"
 API_SEND_GROUP_MSG = "send_group_msg"
@@ -31,7 +31,7 @@ API_TIMEOUT = 30
 RETRY_BASE_DELAY = 2.0
 MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
 ESTIMATED_CHARS_PER_TOKEN = 2
-HISTORY_FETCH_BATCH_SIZE = 200
+HISTORY_FETCH_BATCH_SIZE = 100 
 OVERHEAD_CHARS_PER_MSG = 15
 
 PLATFORM_ONEBOT = ("qq", "onebot", "aiocqhttp", "napcat", "llonebot")
@@ -52,7 +52,7 @@ def _parse_llm_json(text: str) -> dict:
         pass
     raise ValueError(f"JSON 解析失败: {text[:50]}...")
 
-@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.42")
+@register("group_summary_danfong", "Danfong", "群聊总结增强版", "0.1.43")
 class GroupSummaryPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -143,6 +143,7 @@ class GroupSummaryPlugin(Star):
                 pass
             return None
 
+    # ================= 渲染兼容层 =================
     async def html_render(self, template: str, data: dict, options: dict = None) -> Optional[str]:
         try:
             if hasattr(self.context, "image_renderer"):
@@ -151,7 +152,7 @@ class GroupSummaryPlugin(Star):
         except Exception as e:
             err_str = str(e)
             if "content-encoding: br" in err_str.lower():
-                logger.error(f"[{VERSION}] 渲染失败: 缺少 brotli 库。请在插件目录执行: pip install brotli")
+                logger.error(f"[{VERSION}] 渲染失败: 缺少 brotli 库。请安装 pip install brotli")
             else:
                 logger.error(f"[{VERSION}] 渲染失败: {e}")
             return None
@@ -239,28 +240,15 @@ class GroupSummaryPlugin(Star):
         provider = self.context.get_provider_by_id(self.config.get("provider_id")) or self.context.get_using_provider()
         if not provider: return None
 
-        # --- 核心修改：强化 Prompt 要求带人名 ---
         prompt = textwrap.dedent(f"""
         角色：{self.bot_name}。任务：群聊总结。
-        
-        【重要指令】：
-        1. 提取 3-8 个主要话题。
-        2. **必须**在话题摘要中包含**参与讨论的主要群友昵称**。
-           - 正确示例："麻花和徐天明讨论了婚礼费用..."
-           - 正确示例："小青蛙分享了B站会员技巧..."
-           - 错误示例："大家讨论了婚礼..." (太模糊)
+        【指令】：
+        1. 提取3-8个主要话题。
+        2. **必须在摘要中包含人名**（如“小明和老王讨论了...”）。
         3. {self.prompt_style}
-        4. 严禁包含Markdown代码块标记，直接返回JSON。
-        
-        返回格式：
-        {{
-            "topics": [
-                {{"time_range": "HH:MM~HH:MM", "summary": "【人名】+ 事件摘要"}}
-            ], 
-            "closing_remark": "..."
-        }}
-        
-        聊天记录：
+        4. 严禁Markdown代码块，直接返回JSON。
+        格式：{{"topics": [{{"time_range":"", "summary":""}}], "closing_remark":""}}
+        记录：
         <chat_logs>
         {chat_log}
         </chat_logs>
@@ -274,7 +262,7 @@ class GroupSummaryPlugin(Star):
                     data = _parse_llm_json(resp.completion_text)
                     if isinstance(data, dict): return data
             except Exception as e:
-                logger.error(f"[{VERSION}] LLM Attempt {i+1} Failed: {e}")
+                logger.error(f"[{VERSION}] LLM Error: {e}")
         return None
 
     # ================= 流程总控 =================
@@ -313,11 +301,16 @@ class GroupSummaryPlugin(Star):
         except Exception as e:
             raise e
 
-    # ================= 指令入口 =================
+    # ================= 指令入口 (Fix 0.1.43) =================
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
-    async def summarize_group(self, event: AstrMessageEvent, *args, **kwargs):
-        logger.info(f"[{VERSION}] 手动触发收到请求")
+    async def summarize_group(self, event: AstrMessageEvent, query: str = "", **kwargs):
+        """
+        手动指令：/总结群聊
+        query="" : 满足指令解析器的需求 (用户可选输入)
+        **kwargs : 吞噬框架传入的 message/context 等参数，防止 TypeError
+        """
+        logger.info(f"[{VERSION}] 触发: query={query}, kwargs_keys={kwargs.keys()}")
         try:
             bot = await self._get_bot(event)
             gid = event.get_group_id()
@@ -325,7 +318,7 @@ class GroupSummaryPlugin(Star):
                 yield event.plain_result("⚠️ 请在群内使用")
                 return
 
-            yield event.plain_result(f"🌱 正在分析 {gid}...")
+            yield event.plain_result(f"🌱 正在分析 {gid} (v{VERSION})...")
             
             lock = self._get_group_lock(str(gid))
             if lock.locked():
@@ -338,7 +331,7 @@ class GroupSummaryPlugin(Star):
             if img:
                 yield event.image_result(img)
             else:
-                yield event.plain_result(f"❌ 结果为空 (请检查后台日志)")
+                yield event.plain_result(f"❌ 结果为空 (检查日志)")
 
         except Exception as e:
             err = traceback.format_exc()
@@ -346,7 +339,7 @@ class GroupSummaryPlugin(Star):
             yield event.plain_result(f"❌ 运行报错: {e}")
 
     @filter.llm_tool(name="group_summary_tool")
-    async def call_summary_tool(self, event: AstrMessageEvent, *args, **kwargs):
+    async def call_summary_tool(self, event: AstrMessageEvent, query: str = "", **kwargs):
         try:
             bot = await self._get_bot(event)
             gid = event.get_group_id()
