@@ -17,11 +17,10 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 # --- 全局变量：用于防止热重载时的定时器残留 ---
-# 这是一个防止“双重推送”的保险丝
 _GLOBAL_SCHEDULER_INSTANCE = None
 
 # --- 常量配置 ---
-VERSION = "0.1.52" # 锁定版本
+VERSION = "0.1.53" # 优化抽样算法与话题聚合
 DEFAULT_MAX_MSG_COUNT = 2000
 DEFAULT_QUERY_ROUNDS = 20
 DEFAULT_TOKEN_LIMIT = 6000
@@ -61,7 +60,6 @@ class GroupSummaryPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         
-        # 配置加载
         self.max_msg_count = self.config.get("max_msg_count", DEFAULT_MAX_MSG_COUNT)
         self.msg_token_limit = self.config.get("token_limit", DEFAULT_TOKEN_LIMIT)
         self.bot_name = self.config.get("bot_name", "BOT")
@@ -82,7 +80,6 @@ class GroupSummaryPlugin(Star):
         self.global_bot = None
         self.semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-        # 模板加载
         self.html_template = self._load_template()
             
         try:
@@ -90,9 +87,6 @@ class GroupSummaryPlugin(Star):
         except ImportError:
             logger.error(f"群聊总结(v{VERSION}): ⚠️ 未检测到 Playwright")
 
-        # --- 核心修复：定时器初始化 ---
-        # 不在 __init__ 里直接启动，而是等待 setup_schedule 调用
-        # 这里只做属性占位
         self.scheduler = None 
         
         if self.enable_auto_push:
@@ -121,7 +115,6 @@ class GroupSummaryPlugin(Star):
         return mapping
 
     def terminate(self):
-        """生命周期清理：插件卸载时调用"""
         global _GLOBAL_SCHEDULER_INSTANCE
         if self.scheduler and self.scheduler.running:
             self.scheduler.shutdown()
@@ -134,22 +127,15 @@ class GroupSummaryPlugin(Star):
         logger.info(f"群聊总结(v{VERSION}): 资源已释放")
 
     def setup_schedule(self):
-        """配置定时任务（带全局锁机制）"""
         global _GLOBAL_SCHEDULER_INSTANCE
-        
         try:
-            # 1. 如果存在旧的全局定时器，强制关闭
             if _GLOBAL_SCHEDULER_INSTANCE and _GLOBAL_SCHEDULER_INSTANCE.running:
-                logger.warning("检测到残留的定时器实例，正在强制清理...")
                 _GLOBAL_SCHEDULER_INSTANCE.shutdown()
             
-            # 2. 如果当前实例有定时器，也关闭
             if self.scheduler and self.scheduler.running:
                 self.scheduler.shutdown()
             
-            # 3. 创建新定时器
             self.scheduler = AsyncIOScheduler()
-            
             time_str = str(self.push_time).replace("：", ":").strip()
             hour, minute = map(int, time_str.split(":"))
             
@@ -157,9 +143,7 @@ class GroupSummaryPlugin(Star):
             self.scheduler.add_job(self.run_scheduled_task, trigger)
             self.scheduler.start()
             
-            # 4. 注册到全局变量
             _GLOBAL_SCHEDULER_INSTANCE = self.scheduler
-            
             logger.info(f"群聊总结(v{VERSION}): 定时任务已启动 -> {time_str}")
         except Exception as e:
             logger.error(f"定时任务启动失败: {e}")
@@ -213,7 +197,6 @@ class GroupSummaryPlugin(Star):
     async def capture_bot(self, event: AstrMessageEvent):
         if not self.global_bot: 
             self.global_bot = event.bot
-            logger.info(f"群聊总结: Bot 实例已捕获。")
 
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -353,8 +336,6 @@ class GroupSummaryPlugin(Star):
                 continue
             
             raw = m.get("raw_message", "")
-            
-            # 过滤指令消息
             if raw.strip().startswith(("/总结群聊", "总结群聊", "/测试推送")):
                 continue
 
@@ -381,10 +362,26 @@ class GroupSummaryPlugin(Star):
             
         valid.sort(key=lambda x: x["time"])
         
-        chat_log = "\n".join([
-            f"[{datetime.datetime.fromtimestamp(v['time']).strftime('%H:%M')}] {v['name']}: {v['content']}" 
-            for v in valid
-        ])
+        # 组装基础聊天记录列表
+        chat_lines = [f"[{datetime.datetime.fromtimestamp(v['time']).strftime('%H:%M')}] {v['name']}: {v['content']}" for v in valid]
+        
+        # === 智能抽样算法：防止早上的消息被粗暴截断丢失 ===
+        total_len = sum(len(line) for line in chat_lines)
+        if total_len > self.msg_token_limit:
+            # 1. 优先过滤掉极短的无意义消息 (如表情、"哈哈"、"?")
+            meaningful_lines = [line for line in chat_lines if len(line.split(":", 1)[-1].strip()) > 2]
+            total_len = sum(len(line) for line in meaningful_lines)
+            
+            # 2. 如果依然超长，进行等距均匀抽样，保留全天时间线
+            if total_len > self.msg_token_limit:
+                ratio = self.msg_token_limit / total_len
+                keep_count = max(10, int(len(meaningful_lines) * ratio))
+                step = len(meaningful_lines) / keep_count
+                chat_lines = [meaningful_lines[int(i * step)] for i in range(keep_count)]
+            else:
+                chat_lines = meaningful_lines
+
+        chat_log = "\n".join(chat_lines)
         
         return valid, [{"name": k, "count": v} for k,v in users.most_common(5)], trend, chat_log
 
@@ -400,15 +397,12 @@ class GroupSummaryPlugin(Star):
             return None
             
         valid_msgs, top_users, trend, chat_log = res
-        
-        if len(chat_log) > self.msg_token_limit:
-            chat_log = chat_log[-self.msg_token_limit:]
 
         style = self.summary_prompt_style.replace("{bot_name}", self.bot_name)
         if not style:
             style = f"{self.bot_name}的温暖总结，对今天群里的氛围进行点评"
 
-        # --- Prompt 修复：防止人设干扰指令 ---
+        # --- Prompt 修复：强制话题合并与带入人名 ---
         prompt = textwrap.dedent(f"""
             你是一个群聊记录员“{self.bot_name}”。请根据以下的群聊记录（日期：{datetime.datetime.now().strftime('%Y-%m-%d')}），生成一份总结数据。
             
@@ -420,17 +414,17 @@ class GroupSummaryPlugin(Star):
             注意：以上设定仅用于生成"closing_remark"字段，不要复述设定内容。
             
             【任务目标】:
-            1. 分析 3-8 个主要话题。
+            1. 分析提炼出 3-8 个核心话题。
+               - ⚠️ 关键合并逻辑：如果同一个话题在一天内不同时间段被反复提及（比如下午聊了，晚上又接着聊），请**务必合并为同一个话题**，将时间跨度写为完整区间（例如："14:00~21:30"），绝对不要把同一件事拆分成多个时间段的话题。
             2. 使用【角色设定】中的语气，对今天的聊天内容写一段点评（即 closing_remark）。
             3. **必须**在话题摘要中包含**参与讨论的主要群友昵称**。
-           - 正确示例："麻花和徐天明讨论了婚礼费用..."
-           - 正确示例："小青蛙分享了B站会员技巧..."
-           - 错误示例："大家讨论了婚礼..." (太模糊)。
+               - 正确示例："麻花和徐天明讨论了武汉婚礼的场地费用和习俗..."
+               - 错误示例："大家讨论了婚礼..." (没有指出具体是谁，太模糊)。
             
             【输出格式】:
             严格返回 JSON：
             {{
-                "topics": [{{"time_range": "10:00~11:00", "summary": "【人名】+ 事件摘要"}}],
+                "topics": [{{"time_range": "起始时间~结束时间", "summary": "【参与者人名】+ 事件摘要"}}],
                 "closing_remark": "这里填写符合角色设定的点评内容"
             }}
             
