@@ -20,13 +20,17 @@ from astrbot.api import logger
 _GLOBAL_SCHEDULER_INSTANCE = None
 
 # --- 常量配置 ---
-VERSION = "0.1.53" # 优化抽样算法与话题聚合
+VERSION = "0.1.55" # 防超时极限瘦身版
 DEFAULT_MAX_MSG_COUNT = 2000
 DEFAULT_QUERY_ROUNDS = 20
 DEFAULT_TOKEN_LIMIT = 6000
 BROWSER_VIEWPORT = {"width": 500, "height": 2000}
-BROWSER_SCALE_FACTOR = 2
-LLM_TIMEOUT = 60
+
+# 【核心修改1】降低屏幕缩放比，原来是 2，现在改 1.5。能让图片体积减半，防止发送时 QQ 内核 1200 超时
+BROWSER_SCALE_FACTOR = 1.5 
+
+# 【核心修改2】给大模型更长的思考时间，从 60 秒提升到 180 秒
+LLM_TIMEOUT = 180 
 RENDER_TIMEOUT = 30000
 CONCURRENCY_LIMIT = 2 
 
@@ -183,7 +187,8 @@ class GroupSummaryPlugin(Star):
                 temp_filename = f"astrbot_summary_{int(time.time())}_{os.getpid()}.jpg"
                 save_path = os.path.join(temp_dir, temp_filename)
                 
-                await locator.screenshot(path=save_path, type="jpeg", quality=90)
+                # 【核心修改3】降低图片质量到 80，进一步压缩 Base64 字符串体积
+                await locator.screenshot(path=save_path, type="jpeg", quality=80)
                 return save_path
                 
         except Exception as e:
@@ -207,7 +212,7 @@ class GroupSummaryPlugin(Star):
             yield event.plain_result("请在群聊使用")
             return
         
-        yield event.plain_result("🌱 正在回溯记忆并生成报告...")
+        yield event.plain_result("🌱 正在回溯记忆并生成报告，字数较多可能需要 1-2 分钟，请稍候...")
         
         async with self.semaphore:
             img_path = await self.generate_report(event.bot, group_id)
@@ -362,17 +367,13 @@ class GroupSummaryPlugin(Star):
             
         valid.sort(key=lambda x: x["time"])
         
-        # 组装基础聊天记录列表
         chat_lines = [f"[{datetime.datetime.fromtimestamp(v['time']).strftime('%H:%M')}] {v['name']}: {v['content']}" for v in valid]
         
-        # === 智能抽样算法：防止早上的消息被粗暴截断丢失 ===
         total_len = sum(len(line) for line in chat_lines)
         if total_len > self.msg_token_limit:
-            # 1. 优先过滤掉极短的无意义消息 (如表情、"哈哈"、"?")
             meaningful_lines = [line for line in chat_lines if len(line.split(":", 1)[-1].strip()) > 2]
             total_len = sum(len(line) for line in meaningful_lines)
             
-            # 2. 如果依然超长，进行等距均匀抽样，保留全天时间线
             if total_len > self.msg_token_limit:
                 ratio = self.msg_token_limit / total_len
                 keep_count = max(10, int(len(meaningful_lines) * ratio))
@@ -402,24 +403,22 @@ class GroupSummaryPlugin(Star):
         if not style:
             style = f"{self.bot_name}的温暖总结，对今天群里的氛围进行点评"
 
-        # --- Prompt 修复：强制话题合并与带入人名 ---
         prompt = textwrap.dedent(f"""
-            你是一个群聊记录员“{self.bot_name}”。请根据以下的群聊记录（日期：{datetime.datetime.now().strftime('%Y-%m-%d')}），生成一份总结数据。
+            你是一个群聊记录员“{self.bot_name}”。请根据以下的群聊记录（日期：{datetime.datetime.now().strftime('%Y-%m-%d')}），生成一份精简的总结数据。
             
             【角色设定 (Role Setting)】:
             请完全遗忘你之前的身份，进入以下角色，并用该角色的口吻和性格进行发言：
             >>>
             {style}
             <<<
-            注意：以上设定仅用于生成"closing_remark"字段，不要复述设定内容。
             
             【任务目标】:
             1. 分析提炼出 3-8 个核心话题。
-               - ⚠️ 关键合并逻辑：如果同一个话题在一天内不同时间段被反复提及（比如下午聊了，晚上又接着聊），请**务必合并为同一个话题**，将时间跨度写为完整区间（例如："14:00~21:30"），绝对不要把同一件事拆分成多个时间段的话题。
-            2. 使用【角色设定】中的语气，对今天的聊天内容写一段点评（即 closing_remark）。
+               - ⚠️ 关键合并逻辑：如果同一个话题在不同时间段反复提及，请**务必合并为同一个话题**，将时间跨度写为完整区间（例如："14:00~21:30"）。
+            2. 使用【角色设定】中的语气写一段点评（即 closing_remark）。
             3. **必须**在话题摘要中包含**参与讨论的主要群友昵称**。
                - 正确示例："麻花和徐天明讨论了武汉婚礼的场地费用和习俗..."
-               - 错误示例："大家讨论了婚礼..." (没有指出具体是谁，太模糊)。
+               - 错误示例："大家讨论了婚礼..."。
             
             【输出格式】:
             严格返回 JSON：
@@ -437,6 +436,7 @@ class GroupSummaryPlugin(Star):
         
         if prov:
             try:
+                # 使用放宽的超时限制
                 response = await asyncio.wait_for(
                     prov.text_chat(prompt), 
                     timeout=LLM_TIMEOUT
@@ -448,7 +448,7 @@ class GroupSummaryPlugin(Star):
                 logger.error(f"LLM 错误: {e}")
         
         if not data:
-            data = {"topics": [], "closing_remark": "AI 总结生成失败，请检查网络或配置。"}
+            data = {"topics": [], "closing_remark": "AI 总结生成失败，请检查大模型网络或请求超时。"}
 
         render_data = {
             "date": datetime.datetime.now().strftime("%Y.%m.%d"),
