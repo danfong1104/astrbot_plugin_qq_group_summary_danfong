@@ -11,7 +11,7 @@ import textwrap
 import html
 import urllib.parse
 from collections import Counter
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Any, Set
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -24,7 +24,7 @@ from astrbot.api import logger
 _GLOBAL_SCHEDULER_INSTANCE = None
 
 # --- 常量配置 (全面补齐) ---
-VERSION = "0.1.59" 
+VERSION = "0.1.60-PureSignature" 
 DEFAULT_MAX_MSG_COUNT = 2000
 DEFAULT_QUERY_ROUNDS = 20
 DEFAULT_TOKEN_LIMIT = 6000
@@ -42,6 +42,7 @@ HISTORY_FETCH_BATCH_SIZE = 100
 ESTIMATED_CHARS_PER_TOKEN = 2
 OVERHEAD_CHARS_PER_MSG = 15
 PUSH_DELAY_BETWEEN_GROUPS = 5.0
+MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
 
 # API 名称常量
 API_GET_GROUP_MSG_HISTORY = "get_group_msg_history"
@@ -424,7 +425,7 @@ class GroupSummaryPlugin(Star):
             if not silent: raise e
             return None
 
-    # ================= 交互入口 =================
+    # ================= 交互入口 (终极纯净签名) =================
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def capture_bot(self, event: AstrMessageEvent):
         if not self.global_bot: 
@@ -432,7 +433,12 @@ class GroupSummaryPlugin(Star):
 
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
-    async def summarize_group(self, event: AstrMessageEvent, payload=None, **kwargs):
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def summarize_group(self, event: AstrMessageEvent):
+        """
+        手动指令：/总结群聊
+        核心修复：完全清空多余参数，回归 AstrBot 官方标准的纯净事件签名。
+        """
         try:
             bot = await self._get_bot(event)
             gid = event.get_group_id()
@@ -465,14 +471,14 @@ class GroupSummaryPlugin(Star):
 
     @filter.command("测试推送")
     @filter.permission_type(filter.PermissionType.ADMIN)
-    async def test_push(self, event: AstrMessageEvent, payload=None, **kwargs):
+    async def test_push(self, event: AstrMessageEvent):
         if not self.global_bot: self.global_bot = event.bot
         yield event.plain_result("🚀 开始测试推送流程...")
         await self.run_scheduled_task()
         yield event.plain_result("✅ 测试指令结束。")
 
     @filter.llm_tool(name="group_summary_tool")
-    async def call_summary_tool(self, event: AstrMessageEvent, payload=None, **kwargs):
+    async def call_summary_tool(self, event: AstrMessageEvent):
         try:
             bot = await self._get_bot(event)
             gid = event.get_group_id()
