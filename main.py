@@ -9,6 +9,9 @@ import base64
 import tempfile
 import textwrap
 from collections import Counter
+# === 核心修复：补全缺失的类型注解导入 ===
+from typing import List, Dict, Tuple, Optional, Any, Set 
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -20,7 +23,7 @@ from astrbot.api import logger
 _GLOBAL_SCHEDULER_INSTANCE = None
 
 # --- 常量配置 ---
-VERSION = "0.1.57-DebugLLM" 
+VERSION = "0.1.58-FixImport" 
 DEFAULT_MAX_MSG_COUNT = 2000
 DEFAULT_QUERY_ROUNDS = 20
 DEFAULT_TOKEN_LIMIT = 6000
@@ -188,7 +191,8 @@ class GroupSummaryPlugin(Star):
 
     @filter.command("总结群聊")
     @filter.permission_type(filter.PermissionType.ADMIN)
-    async def summarize_group(self, event: AstrMessageEvent):
+    async def summarize_group(self, event: AstrMessageEvent, payload=None, **kwargs):
+        """手动指令：/总结群聊"""
         if not self.global_bot: self.global_bot = event.bot
         group_id = event.get_group_id()
         if not group_id: 
@@ -198,7 +202,7 @@ class GroupSummaryPlugin(Star):
         yield event.plain_result("🌱 正在回溯记忆并生成报告，字数较多可能需要 1-2 分钟，请稍候...")
         
         async with self.semaphore:
-            img_path = await self.generate_report(event.bot, group_id)
+            img_path = await self.generate_report(event.bot, group_id, silent=False)
         
         if img_path and os.path.exists(img_path):
             yield event.image_result(img_path)
@@ -210,14 +214,14 @@ class GroupSummaryPlugin(Star):
 
     @filter.command("测试推送")
     @filter.permission_type(filter.PermissionType.ADMIN)
-    async def test_push(self, event: AstrMessageEvent):
+    async def test_push(self, event: AstrMessageEvent, payload=None, **kwargs):
         if not self.global_bot: self.global_bot = event.bot
         yield event.plain_result("🚀 开始测试推送流程...")
         await self.run_scheduled_task()
         yield event.plain_result("✅ 测试指令结束。")
 
     @filter.llm_tool(name="group_summary_tool")
-    async def call_summary_tool(self, event: AstrMessageEvent):
+    async def call_summary_tool(self, event: AstrMessageEvent, payload=None, **kwargs):
         if not self.global_bot: self.global_bot = event.bot
         group_id = event.get_group_id()
         if not group_id: 
@@ -226,7 +230,7 @@ class GroupSummaryPlugin(Star):
         
         yield event.plain_result("🌱 正在分析...")
         async with self.semaphore:
-            img_path = await self.generate_report(event.bot, group_id)
+            img_path = await self.generate_report(event.bot, group_id, silent=False)
         
         if img_path and os.path.exists(img_path):
             yield event.image_result(img_path)
@@ -256,6 +260,8 @@ class GroupSummaryPlugin(Star):
             finally:
                 try: os.remove(img_path)
                 except: pass
+        else:
+            logger.warning(f"群 {group_id} 报告生成失败")
 
     async def run_scheduled_task(self):
         if not self.global_bot or not self.push_groups:
@@ -277,12 +283,15 @@ class GroupSummaryPlugin(Star):
             if len(msgs) >= self.max_msg_count:
                 break
             try:
-                ret = await bot.api.call_action(
-                    "get_group_msg_history", 
-                    group_id=group_id, 
-                    count=100, 
-                    message_seq=seq, 
-                    reverseOrder=True
+                ret = await asyncio.wait_for(
+                    bot.api.call_action(
+                        "get_group_msg_history", 
+                        group_id=group_id, 
+                        count=100, 
+                        message_seq=seq, 
+                        reverseOrder=True
+                    ),
+                    timeout=30
                 )
                 batch = ret.get("messages", [])
                 if not batch: break
@@ -389,27 +398,23 @@ class GroupSummaryPlugin(Star):
             try:
                 if i > 0: await asyncio.sleep(RETRY_BASE_DELAY)
                 
-                # 发起请求
                 response = await asyncio.wait_for(provider.text_chat(prompt), timeout=LLM_TIMEOUT)
                 
-                # 检查返回值
                 if not response or not response.completion_text:
                     last_error = f"第 {i+1} 次请求: 大模型返回了空白内容！可能由于模型安全策略拦截。"
                     continue
                 
-                # 尝试解析 JSON
                 try:
                     data = _parse_llm_json(response.completion_text)
                     if isinstance(data, dict) and "topics" in data:
                         return data, ""
                 except Exception as parse_e:
-                    # 将大模型胡言乱语的前 50 个字提取出来
                     bad_text = response.completion_text.replace('\n', ' ')[:50]
                     last_error = f"第 {i+1} 次解析失败: 模型未返回标准 JSON。模型实际回复了: '{bad_text}...' (异常: {parse_e})"
                     continue
 
             except asyncio.TimeoutError:
-                last_error = f"第 {i+1} 次请求: 大模型在 {LLM_TIMEOUT} 秒内未响应 (Timeout)。这通常是因为模型平台拥堵或你在 AstrBot 配置的网络代理失效。"
+                last_error = f"第 {i+1} 次请求: 大模型在 {LLM_TIMEOUT} 秒内未响应 (Timeout)。这通常是因为模型平台拥堵或代理失效。"
             except Exception as e:
                 last_error = f"第 {i+1} 次请求: 接口报错 -> {str(e)}"
                 
@@ -432,7 +437,6 @@ class GroupSummaryPlugin(Star):
         data, err_reason = await self._run_llm_with_debug(chat_log)
         
         if not data:
-            # 【这里是把错误写进图片的核心逻辑】
             data = {
                 "topics": [{"time_range": "错误诊断", "summary": "开发者请看下方的调试信息 👇"}], 
                 "closing_remark": f"🚨 **大模型调用彻底失败！**\n\n**详细诊断日志：**\n{err_reason}\n\n*请根据上述红字提示排查 AstrBot 设置。*"
