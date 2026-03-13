@@ -16,26 +16,21 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
-# --- 全局变量：用于防止热重载时的定时器残留 ---
+# --- 全局变量 ---
 _GLOBAL_SCHEDULER_INSTANCE = None
 
 # --- 常量配置 ---
-VERSION = "0.1.55" # 防超时极限瘦身版
+VERSION = "0.1.57-DebugLLM" 
 DEFAULT_MAX_MSG_COUNT = 2000
 DEFAULT_QUERY_ROUNDS = 20
 DEFAULT_TOKEN_LIMIT = 6000
 BROWSER_VIEWPORT = {"width": 500, "height": 2000}
-
-# 【核心修改1】降低屏幕缩放比，原来是 2，现在改 1.5。能让图片体积减半，防止发送时 QQ 内核 1200 超时
-BROWSER_SCALE_FACTOR = 1.5 
-
-# 【核心修改2】给大模型更长的思考时间，从 60 秒提升到 180 秒
-LLM_TIMEOUT = 180 
+BROWSER_SCALE_FACTOR = 1.5
+LLM_TIMEOUT = 180
 RENDER_TIMEOUT = 30000
 CONCURRENCY_LIMIT = 2 
 
 def _parse_llm_json(text: str) -> dict:
-    """增强型 JSON 解析器"""
     text = text.strip()
     if "```" in text:
         text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE | re.DOTALL).strip()
@@ -45,17 +40,15 @@ def _parse_llm_json(text: str) -> dict:
         data = json.loads(text)
     except json.JSONDecodeError:
         try:
-            match = re.search(r"\{[\s\S]*\}", text)
+            match = re.search(r"(\{[\s\S]*\})", text)
             if match: 
                 data = json.loads(match.group())
         except Exception: 
             pass
             
     if not isinstance(data, dict):
-        return {}
+        raise ValueError("解析出非字典结构")
     
-    data.setdefault("topics", [])
-    data.setdefault("closing_remark", "数据解析异常")
     return data
 
 @register("group_summary_danfong", "Danfong", "群聊总结增强版", VERSION)
@@ -128,7 +121,6 @@ class GroupSummaryPlugin(Star):
                 _GLOBAL_SCHEDULER_INSTANCE.shutdown()
             except: pass
             _GLOBAL_SCHEDULER_INSTANCE = None
-        logger.info(f"群聊总结(v{VERSION}): 资源已释放")
 
     def setup_schedule(self):
         global _GLOBAL_SCHEDULER_INSTANCE
@@ -154,7 +146,6 @@ class GroupSummaryPlugin(Star):
 
     async def render_locally(self, html_template: str, data: dict):
         from playwright.async_api import async_playwright
-        
         try:
             env = jinja2.Environment(autoescape=True)
             template = env.from_string(html_template)
@@ -166,31 +157,23 @@ class GroupSummaryPlugin(Star):
         browser = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    args=["--no-sandbox", "--disable-setuid-sandbox"]
-                )
-                page = await browser.new_page(
-                    viewport=BROWSER_VIEWPORT,
-                    device_scale_factor=BROWSER_SCALE_FACTOR
-                )
-                
+                browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+                page = await browser.new_page(viewport=BROWSER_VIEWPORT, device_scale_factor=BROWSER_SCALE_FACTOR)
                 await page.route("**", lambda route: route.abort())
                 await page.set_content(html_content)
                 
                 try:
                     await page.wait_for_load_state("load", timeout=RENDER_TIMEOUT)
                 except Exception:
-                    logger.warning("页面加载等待超时，尝试强制截图")
+                    pass
 
                 locator = page.locator(".container")
                 temp_dir = tempfile.gettempdir()
                 temp_filename = f"astrbot_summary_{int(time.time())}_{os.getpid()}.jpg"
                 save_path = os.path.join(temp_dir, temp_filename)
                 
-                # 【核心修改3】降低图片质量到 80，进一步压缩 Base64 字符串体积
                 await locator.screenshot(path=save_path, type="jpeg", quality=80)
                 return save_path
-                
         except Exception as e:
             logger.error(f"Playwright 渲染失败: {str(e)}")
             return None
@@ -273,18 +256,14 @@ class GroupSummaryPlugin(Star):
             finally:
                 try: os.remove(img_path)
                 except: pass
-        else:
-            logger.warning(f"群 {group_id} 报告生成失败")
 
     async def run_scheduled_task(self):
         if not self.global_bot or not self.push_groups:
             return
-        
         logger.info("⏳ 定时推送开始...")
         tasks = [self._process_single_group_task(gid) for gid in self.push_groups]
         if tasks:
             await asyncio.gather(*tasks)
-        logger.info("✅ 定时推送完成")
 
     async def get_data(self, bot, group_id):
         now = datetime.datetime.now()
@@ -306,8 +285,7 @@ class GroupSummaryPlugin(Star):
                     reverseOrder=True
                 )
                 batch = ret.get("messages", [])
-                if not batch:
-                    break
+                if not batch: break
                 
                 oldest_in_batch = batch[-1].get("time", 0)
                 newest_in_batch = batch[0].get("time", 0)
@@ -323,13 +301,9 @@ class GroupSummaryPlugin(Star):
                         seen_ids.add(mid)
                         msgs.append(m)
                 
-                if oldest_in_batch < start:
-                    break
-                if not seq:
-                    break
-                    
-            except Exception as e:
-                logger.error(f"获取消息历史失败: {e}")
+                if oldest_in_batch < start: break
+                if not seq: break
+            except Exception:
                 break
         
         valid = []
@@ -337,43 +311,32 @@ class GroupSummaryPlugin(Star):
         trend = {f"{h:02d}": 0 for h in range(24)}
         
         for m in msgs:
-            if m.get("time", 0) < start:
-                continue
-            
+            if m.get("time", 0) < start: continue
             raw = m.get("raw_message", "")
-            if raw.strip().startswith(("/总结群聊", "总结群聊", "/测试推送")):
-                continue
-
+            if raw.strip().startswith(("/总结群聊", "总结群聊", "/测试推送")): continue
+            
             sender = m.get("sender", {})
             user_id = str(sender.get("user_id", ""))
             nick = sender.get("card") or sender.get("nickname") or "用户"
             
-            if nick in self.exclude_users or user_id in self.exclude_users:
-                continue
-
-            if self.enable_name_mapping and user_id in self.name_map:
-                nick = self.name_map[user_id]
+            if nick in self.exclude_users or user_id in self.exclude_users: continue
+            if self.enable_name_mapping and user_id in self.name_map: nick = self.name_map[user_id]
             
             content = raw.replace("\n", " ") 
-            if len(content) > 300:
-                content = content[:300] + "..."
+            if len(content) > 300: content = content[:300] + "..."
             
             valid.append({"time": m["time"], "name": nick, "content": content})
             users[nick] += 1
-            
             hour_key = datetime.datetime.fromtimestamp(m["time"]).strftime("%H")
-            if hour_key in trend:
-                trend[hour_key] += 1
+            if hour_key in trend: trend[hour_key] += 1
             
         valid.sort(key=lambda x: x["time"])
-        
         chat_lines = [f"[{datetime.datetime.fromtimestamp(v['time']).strftime('%H:%M')}] {v['name']}: {v['content']}" for v in valid]
         
         total_len = sum(len(line) for line in chat_lines)
         if total_len > self.msg_token_limit:
             meaningful_lines = [line for line in chat_lines if len(line.split(":", 1)[-1].strip()) > 2]
             total_len = sum(len(line) for line in meaningful_lines)
-            
             if total_len > self.msg_token_limit:
                 ratio = self.msg_token_limit / total_len
                 keep_count = max(10, int(len(meaningful_lines) * ratio))
@@ -383,21 +346,15 @@ class GroupSummaryPlugin(Star):
                 chat_lines = meaningful_lines
 
         chat_log = "\n".join(chat_lines)
-        
         return valid, [{"name": k, "count": v} for k,v in users.most_common(5)], trend, chat_log
 
-    async def generate_report(self, bot, group_id, silent=False):
-        try:
-            info = await bot.api.call_action("get_group_info", group_id=group_id)
-        except Exception:
-            info = {"group_name": "群聊"}
+    # ================= 核心：捕获 LLM 详细错误 =================
+    async def _run_llm_with_debug(self, chat_log: str) -> Tuple[Optional[dict], str]:
+        """执行 LLM 并返回 (结果字典, 详细错误信息)"""
+        provider = self.context.get_provider_by_id(self.config.get("provider_id")) or self.context.get_using_provider()
         
-        res = await self.get_data(bot, group_id)
-        if not res or not res[0]:
-            if not silent: logger.warning(f"群 {group_id} 无数据。")
-            return None
-            
-        valid_msgs, top_users, trend, chat_log = res
+        if not provider:
+            return None, "❌ 致命错误: AstrBot 未配置任何可用的大模型 (Provider)。请进入 AstrBot 管理面板设置默认模型！"
 
         style = self.summary_prompt_style.replace("{bot_name}", self.bot_name)
         if not style:
@@ -413,15 +370,11 @@ class GroupSummaryPlugin(Star):
             <<<
             
             【任务目标】:
-            1. 分析提炼出 3-8 个核心话题。
-               - ⚠️ 关键合并逻辑：如果同一个话题在不同时间段反复提及，请**务必合并为同一个话题**，将时间跨度写为完整区间（例如："14:00~21:30"）。
+            1. 分析提炼出 1-8 个核心话题。哪怕记录里只有 1 句话，也要为这 1 句话生成 1 个话题并按格式输出！
             2. 使用【角色设定】中的语气写一段点评（即 closing_remark）。
             3. **必须**在话题摘要中包含**参与讨论的主要群友昵称**。
-               - 正确示例："麻花和徐天明讨论了武汉婚礼的场地费用和习俗..."
-               - 错误示例："大家讨论了婚礼..."。
             
-            【输出格式】:
-            严格返回 JSON：
+            【输出格式】 (绝对不要输出 Markdown 代码块，必须直接返回 JSON):
             {{
                 "topics": [{{"time_range": "起始时间~结束时间", "summary": "【参与者人名】+ 事件摘要"}}],
                 "closing_remark": "这里填写符合角色设定的点评内容"
@@ -430,25 +383,60 @@ class GroupSummaryPlugin(Star):
             【聊天记录】:
             {chat_log}
         """)
-        
-        data = {}
-        prov = self.context.get_provider_by_id(self.config.get("provider_id")) or self.context.get_using_provider()
-        
-        if prov:
+
+        last_error = "未知错误"
+        for i in range(MAX_RETRY_ATTEMPTS):
             try:
-                # 使用放宽的超时限制
-                response = await asyncio.wait_for(
-                    prov.text_chat(prompt), 
-                    timeout=LLM_TIMEOUT
-                )
-                data = _parse_llm_json(response.completion_text)
+                if i > 0: await asyncio.sleep(RETRY_BASE_DELAY)
+                
+                # 发起请求
+                response = await asyncio.wait_for(provider.text_chat(prompt), timeout=LLM_TIMEOUT)
+                
+                # 检查返回值
+                if not response or not response.completion_text:
+                    last_error = f"第 {i+1} 次请求: 大模型返回了空白内容！可能由于模型安全策略拦截。"
+                    continue
+                
+                # 尝试解析 JSON
+                try:
+                    data = _parse_llm_json(response.completion_text)
+                    if isinstance(data, dict) and "topics" in data:
+                        return data, ""
+                except Exception as parse_e:
+                    # 将大模型胡言乱语的前 50 个字提取出来
+                    bad_text = response.completion_text.replace('\n', ' ')[:50]
+                    last_error = f"第 {i+1} 次解析失败: 模型未返回标准 JSON。模型实际回复了: '{bad_text}...' (异常: {parse_e})"
+                    continue
+
             except asyncio.TimeoutError:
-                logger.error("LLM 请求超时")
+                last_error = f"第 {i+1} 次请求: 大模型在 {LLM_TIMEOUT} 秒内未响应 (Timeout)。这通常是因为模型平台拥堵或你在 AstrBot 配置的网络代理失效。"
             except Exception as e:
-                logger.error(f"LLM 错误: {e}")
+                last_error = f"第 {i+1} 次请求: 接口报错 -> {str(e)}"
+                
+        return None, last_error
+
+    async def generate_report(self, bot, group_id, silent=False):
+        try:
+            info = await bot.api.call_action("get_group_info", group_id=group_id)
+        except Exception:
+            info = {"group_name": "群聊"}
+        
+        res = await self.get_data(bot, group_id)
+        if not res or not res[0]:
+            if not silent: logger.warning(f"群 {group_id} 无数据。")
+            return None
+            
+        valid_msgs, top_users, trend, chat_log = res
+
+        # 调用带详细报错信息的 LLM 运行器
+        data, err_reason = await self._run_llm_with_debug(chat_log)
         
         if not data:
-            data = {"topics": [], "closing_remark": "AI 总结生成失败，请检查大模型网络或请求超时。"}
+            # 【这里是把错误写进图片的核心逻辑】
+            data = {
+                "topics": [{"time_range": "错误诊断", "summary": "开发者请看下方的调试信息 👇"}], 
+                "closing_remark": f"🚨 **大模型调用彻底失败！**\n\n**详细诊断日志：**\n{err_reason}\n\n*请根据上述红字提示排查 AstrBot 设置。*"
+            }
 
         render_data = {
             "date": datetime.datetime.now().strftime("%Y.%m.%d"),
